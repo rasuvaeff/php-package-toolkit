@@ -732,7 +732,7 @@ Or through the Makefile: `make build`, `make cs-fix`, `make psalm`, `make test`.
 | `psalm` fails | Fix the root cause. **Never** add `@psalm-suppress`. If a global suppression is unavoidable, put it in `psalm.xml` under `<issueHandlers>` |
 | `require-checker` fails | Add the missing dependency to `composer.json` |
 | `testo` fails | Read the test output, fix the code |
-| `rector` fails | `make rector:fix` |
+| `rector` fails | `make rector-fix` |
 
 ### Integration tests
 
