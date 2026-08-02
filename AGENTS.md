@@ -32,6 +32,9 @@ There is no PHP/Composer on the host — everything runs through Docker
 | `testo.php` | `templates/testo.php` | Verbatim — Unit + Benchmarks suites, `src` for coverage |
 | `.github/workflows/build.yml` | `templates/.github/workflows/build.yml` | Replace `{{PHP_EXTENSIONS}}` |
 | `.github/workflows/static-analysis.yml` | `templates/.github/workflows/static-analysis.yml` | Replace `{{PHP_EXTENSIONS}}` |
+| `.github/ISSUE_TEMPLATE/bug_report.yml` | `templates/.github/ISSUE_TEMPLATE/bug_report.yml` | Unchanged |
+| `.github/ISSUE_TEMPLATE/feature_request.yml` | `templates/.github/ISSUE_TEMPLATE/feature_request.yml` | Unchanged |
+| `.github/ISSUE_TEMPLATE/config.yml` | `templates/.github/ISSUE_TEMPLATE/config.yml` | Unchanged — no placeholders (Discussions is disabled on every repository) |
 | `src/` | Create | One class = one file |
 | `tests/` | Create | `<ClassName>Test.php` for every class |
 | `tests/Integration/` | Create | If tests against external services are needed |
