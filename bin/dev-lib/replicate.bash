@@ -56,6 +56,7 @@ cmd_replicate_files() {
       continue
     fi
     for f in $drift; do
+      mkdir -p "$(dirname "$WORKSPACE_ROOT/$pkg/$f")"
       cp "$WORKSPACE_ROOT/templates/$f" "$WORKSPACE_ROOT/$pkg/$f" || { dev_fail_row "$pkg" "copy failed: $f"; continue 2; }
     done
     dev_row "$pkg" "updated: $drift"

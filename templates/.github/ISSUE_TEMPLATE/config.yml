@@ -1,5 +1,1 @@
 blank_issues_enabled: false
-contact_links:
-  - name: Questions and usage help
-    url: https://github.com/rasuvaeff/{{PACKAGE_KEBAB}}/discussions
-    about: For "how do I..." questions that aren't a bug or a feature request
