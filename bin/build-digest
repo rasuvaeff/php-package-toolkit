@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# build-digest — run a composer script for a package inside the composer:2
+# Docker image, capture the full output to a log file, and print only a
+# compact PASS/FAIL summary. Full docker/composer/psalm/testo output for a
+# single package routinely runs to hundreds of lines; this keeps that out
+# of the caller's context by default while still leaving it on disk to
+# inspect on failure (or always, via the printed log path).
+#
+# Usage:
+#   bin/build-digest <package-dir> <composer-script> [-- <extra args>]
+#   bin/build-digest duration build
+#   bin/build-digest duration test
+#   bin/build-digest yii3-outbox psalm
+#   bin/build-digest yii3-outbox require -- rasuvaeff/duration --dry-run
+#
+# Log: <package-dir>/build/digest-<script>.log (overwritten each run;
+# build/* is gitignored in every package template).
+# Exit code: mirrors the underlying `composer <script>` exit code.
+
+set -uo pipefail
+
+if [ "$#" -lt 2 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+pkg_dir="$1"; shift
+script="$1"; shift
+if [ "${1:-}" = "--" ]; then
+    shift
+fi
+extra_args=("$@")
+
+if [ ! -d "$pkg_dir" ] || [ ! -f "$pkg_dir/composer.json" ]; then
+    echo "FAIL: $pkg_dir is not a package directory (no composer.json)" >&2
+    exit 1
+fi
+
+pkg_dir="$(cd "$pkg_dir" && pwd)"
+mkdir -p "$pkg_dir/build"
+log="$pkg_dir/build/digest-$script.log"
+
+docker run --rm -v "$pkg_dir":/app -w /app composer:2 composer "$script" "${extra_args[@]}" >"$log" 2>&1
+rc=$?
+
+lines=$(wc -l <"$log")
+if [ "$rc" -eq 0 ]; then
+    echo "PASS: composer $script ($lines lines, log: $log)"
+else
+    echo "FAIL: composer $script exit=$rc ($lines lines, log: $log)"
+    echo "── last 30 lines ──"
+    tail -30 "$log"
+fi
+
+exit "$rc"

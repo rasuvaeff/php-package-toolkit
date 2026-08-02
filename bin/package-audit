@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+#
+# package-audit — deterministic convention audit for rasuvaeff/* packages.
+#
+# Mirrors the prose checklist of the `review-php-package` skill so a human and an
+# agent run the same checks. Structural checks need only bash/grep/find; the
+# examples lint+run check shells out to the `composer:2` Docker image and is
+# skipped (with a warning) when Docker is unavailable.
+#
+# Usage:
+#   bin/package-audit <package-dir>     audit one package
+#   bin/package-audit --all             audit every rasuvaeff/* package under the repo root
+#   bin/package-audit                   same as --all
+#
+# Env:
+#   PKG_AUDIT_NO_EXAMPLES=1   skip the examples lint/run check (fast structural-only run)
+#
+# Exit code: non-zero if any audited package has at least one ERROR.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Files required by the "Required file set" table in the root AGENTS.md.
+REQUIRED_FILES=(
+  composer.json
+  .php-cs-fixer.php
+  psalm.xml
+  infection.json5
+  rector.php
+  .editorconfig
+  .gitignore
+  .gitattributes
+  LICENSE.md
+  CHANGELOG.md
+  README.md
+  llms.txt
+  AGENTS.md
+  CLAUDE.md
+  Makefile
+  .github/workflows/build.yml
+  .github/workflows/static-analysis.yml
+  examples/README.md
+)
+REQUIRED_DIRS=(src tests examples)
+# Required-but-non-blocking files (reported as WARN, not ERROR).
+WARN_FILES=(build/.gitkeep)
+
+# ── output helpers ────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_BLD=$'\033[1m'; C_RST=$'\033[0m'
+else
+  C_RED=''; C_GRN=''; C_YEL=''; C_BLD=''; C_RST=''
+fi
+
+# Per-package accumulators (reset in audit_one).
+declare -a ERRORS WARNS
+
+err()  { ERRORS+=("$1"); }
+warn() { WARNS+=("$1"); }
+
+# Print a single check line. $1 = label, $2 = number of errors, $3 = number of
+# warnings for this check, $4 = optional detail.
+check_line() {
+  local label="$1" e="$2" w="$3" detail="${4:-}"
+  if [ "$e" -gt 0 ]; then
+    printf '  %-16s %sFAIL%s %s\n' "$label" "$C_RED" "$C_RST" "$detail"
+  elif [ "$w" -gt 0 ]; then
+    printf '  %-16s %sWARN%s %s\n' "$label" "$C_YEL" "$C_RST" "$detail"
+  else
+    printf '  %-16s %sPASS%s %s\n' "$label" "$C_GRN" "$C_RST" "$detail"
+  fi
+}
+
+# ── examples/README.md "Needs server?" table parser ───────────────────────────
+# Emits "<filename>\t<yes|no>" for every script listed in the first table whose
+# header has a "Script" column. Files without a "Needs server" column default to
+# "no" (server-independent).
+examples_server_map() {
+  local readme="$1"
+  [ -f "$readme" ] || return 0
+  awk -F'|' '
+    function trim(s){ gsub(/^[ \t`]+/,"",s); gsub(/[ \t`]+$/,"",s); return s }
+    /^[[:space:]]*\|/ {
+      sep=1
+      for(i=2;i<NF;i++){ c=$i; gsub(/[ \t]/,"",c); if(c !~ /^:?-+:?$/) sep=0 }
+      if(sep && intab) next
+      ishdr=0; sc=0; vc=0
+      for(i=2;i<NF;i++){ t=tolower(trim($i)); if(t=="script"){ishdr=1; sc=i} if(t ~ /needs.*server/) vc=i }
+      if(ishdr){ intab=1; scol=sc; vcol=vc; next }
+      if(intab){
+        name=trim($scol); serv="no"
+        # With a "Needs server" column, only an explicit "no"/"нет"/"false" cell
+        # means runnable; anything else ("Yes (Redis)", "Yes", …) is server-bound.
+        if(vcol>0){ s=tolower(trim($vcol)); if(s !~ /^(no|нет|false)/) serv="yes" }
+        if(name!="") printf "%s\t%s\n", name, serv
+      }
+      next
+    }
+    { intab=0 }
+  ' "$readme"
+}
+
+# ── single-package audit ──────────────────────────────────────────────────────
+# Returns 0 if no ERRORs, 1 otherwise.
+audit_one() {
+  local pkg; pkg="$(cd "$1" && pwd)"
+  ERRORS=(); WARNS=()
+
+  local name
+  name="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$pkg/composer.json" 2>/dev/null \
+          | head -1 | sed -E 's/.*"name"[^"]*"([^"]+)".*/\1/')"
+  [ -n "$name" ] || name="$(basename "$pkg")"
+
+  # Applications are not libraries: they have no public API to mark `@api`, no
+  # llms.txt to keep in sync, no BC surface, and no reason to carry psalm/
+  # infection/rector configs. Auditing them against the library checklist
+  # produces only noise.
+  if is_application "$pkg"; then
+    printf '%sskip%s %s (type: project, not a library)\n' "$C_YEL" "$C_RST" "$name"
+
+    return 0
+  fi
+
+  printf '%s══ %s ══%s\n' "$C_BLD" "$name" "$C_RST"
+
+  # 1. required files / dirs ---------------------------------------------------
+  local f e w missing=()
+  for f in "${REQUIRED_FILES[@]}"; do
+    [ -f "$pkg/$f" ] || { missing+=("$f"); err "missing file: $f"; }
+  done
+  for f in "${REQUIRED_DIRS[@]}"; do
+    [ -d "$pkg/$f" ] || { missing+=("$f/"); err "missing dir: $f/"; }
+  done
+  local warn_missing=()
+  for f in "${WARN_FILES[@]}"; do
+    [ -f "$pkg/$f" ] || { warn_missing+=("$f"); warn "missing file: $f"; }
+  done
+  # CLAUDE.md must reference @AGENTS.md
+  if [ -f "$pkg/CLAUDE.md" ] && ! grep -q '@AGENTS.md' "$pkg/CLAUDE.md"; then
+    missing+=("CLAUDE.md→@AGENTS.md"); err "CLAUDE.md does not contain @AGENTS.md"
+  fi
+  e=${#missing[@]}; w=${#warn_missing[@]}
+  local detail=""
+  [ "$e" -gt 0 ] && detail="${missing[*]}"
+  [ "$w" -gt 0 ] && detail="$detail${detail:+; }warn: ${warn_missing[*]}"
+  check_line "files" "$e" "$w" "$detail"
+
+  # 2. no @psalm-suppress / no baseline ---------------------------------------
+  local sup_files baseline_hits=0 sup_count=0
+  sup_files="$(grep -rIlE '@psalm-suppress' "$pkg/src" "$pkg/tests" 2>/dev/null || true)"
+  [ -n "$sup_files" ] && sup_count="$(printf '%s\n' "$sup_files" | grep -c . )"
+  if [ -f "$pkg/psalm.xml" ] && grep -qiE 'errorBaseline|<baseline' "$pkg/psalm.xml"; then
+    baseline_hits=1
+  fi
+  if [ -n "$(find "$pkg" -maxdepth 1 -iname '*baseline*.xml' 2>/dev/null)" ]; then
+    baseline_hits=1
+  fi
+  e=0; detail=""
+  if [ "$sup_count" -gt 0 ]; then e=$((e+1)); err "@psalm-suppress in $sup_count file(s)"; detail="@psalm-suppress in: $(printf '%s ' $sup_files | sed "s#$pkg/##g")"; fi
+  if [ "$baseline_hits" -gt 0 ]; then e=$((e+1)); err "psalm baseline present"; detail="$detail${detail:+; }psalm baseline present"; fi
+  check_line "psalm-suppress" "$e" 0 "$detail"
+
+  # 3. every src type has @api or @internal -----------------------------------
+  local srcfile bad_api=() api_types=()
+  while IFS= read -r srcfile; do
+    [ -n "$srcfile" ] || continue
+    grep -qE '^[[:space:]]*(abstract +|final +|readonly +)*(class|interface|trait|enum)[[:space:]]+[A-Za-z_]' "$srcfile" || continue
+    if grep -qE '@api' "$srcfile"; then
+      api_types+=("$srcfile")
+    elif ! grep -qE '@internal' "$srcfile"; then
+      bad_api+=("${srcfile#$pkg/}")
+      err "src type without @api/@internal: ${srcfile#$pkg/}"
+    fi
+  done < <(find "$pkg/src" -name '*.php' 2>/dev/null | sort)
+  e=${#bad_api[@]}
+  check_line "src @api" "$e" 0 "$([ "$e" -gt 0 ] && echo "${bad_api[*]}")"
+
+  # 4. every test class has #[CoversClass] or #[CoversNothing] -----------------
+  local tf bad_covers=()
+  while IFS= read -r tf; do
+    [ -n "$tf" ] || continue
+    grep -qE '^[[:space:]]*(abstract +|final +)*class[[:space:]]+[A-Za-z_]' "$tf" || continue
+    grep -qE '#\[(Covers|CoversNothing)' "$tf" || { bad_covers+=("${tf#$pkg/}"); err "test without Covers/CoversNothing: ${tf#$pkg/}"; }
+  done < <(find "$pkg/tests" -name '*Test.php' 2>/dev/null | sort)
+  e=${#bad_covers[@]}
+  check_line "test covers" "$e" 0 "$([ "$e" -gt 0 ] && echo "${bad_covers[*]}")"
+
+  # 5. every @api class mentioned in README.md or llms.txt (WARN) -------------
+  local t tname undoc=()
+  for t in "${api_types[@]}"; do
+    # Anchored to a declaration line on purpose: an unanchored match takes the
+    # first occurrence anywhere in the file, and a docblock sentence containing
+    # "one enum would ..." precedes the declaration it documents.
+    tname="$(grep -oE '^[[:space:]]*(abstract +|final +|readonly +)*(class|interface|trait|enum)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$t" \
+             | head -1 | awk '{print $NF}')"
+    [ -n "$tname" ] || continue
+    if ! grep -qw "$tname" "$pkg/README.md" "$pkg/llms.txt" 2>/dev/null; then
+      undoc+=("$tname"); warn "@api type not in README/llms: $tname"
+    fi
+  done
+  w=${#undoc[@]}
+  check_line "api in docs" 0 "$w" "$([ "$w" -gt 0 ] && echo "${undoc[*]}")"
+
+  # 6. examples lint + run (server-independent only) --------------------------
+  audit_examples "$pkg"
+
+  # 7. no stale `make x:y` commands in docs ------------------------------------
+  local stale
+  stale="$(grep -rnE 'make [a-z][a-z0-9-]*:[a-z0-9:-]+' "$pkg" --include='*.md' \
+           --exclude-dir=vendor --exclude-dir=.git --exclude-dir=build --exclude-dir=node_modules \
+           2>/dev/null | sed "s#$pkg/##" || true)"
+  if [ -n "$stale" ]; then
+    e="$(printf '%s\n' "$stale" | grep -c .)"
+    while IFS= read -r line; do err "stale command in docs: $line"; done <<< "$stale"
+    check_line "stale cmds" "$e" 0 "$(printf '%s\n' "$stale" | head -1 | cut -c1-60)…"
+  else
+    check_line "stale cmds" 0 0
+  fi
+
+  # summary --------------------------------------------------------------------
+  local ne=${#ERRORS[@]} nw=${#WARNS[@]}
+  if [ "$ne" -gt 0 ]; then
+    printf '  %s→ %d error(s), %d warning(s)%s\n\n' "$C_RED" "$ne" "$nw" "$C_RST"
+    return 1
+  fi
+  printf '  %s→ 0 errors, %d warning(s)%s\n\n' "$C_GRN" "$nw" "$C_RST"
+  return 0
+}
+
+# Examples lint (all) + run (server-independent, non-helper, table-listed).
+audit_examples() {
+  local pkg="$1"
+  local files
+  files="$(find "$pkg/examples" -maxdepth 1 -name '*.php' 2>/dev/null | sort)"
+  if [ -z "$files" ]; then
+    check_line "examples" 0 0 "(no example scripts)"
+    return
+  fi
+  if [ -n "${PKG_AUDIT_NO_EXAMPLES:-}" ]; then
+    check_line "examples" 0 0 "(skipped: PKG_AUDIT_NO_EXAMPLES)"
+    return
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "examples lint/run skipped: docker unavailable"
+    check_line "examples" 0 1 "(skipped: docker unavailable)"
+    return
+  fi
+
+  # server map: basename -> yes|no
+  declare -A SERVER
+  local fn srv
+  while IFS=$'\t' read -r fn srv; do
+    [ -n "$fn" ] && SERVER["$fn"]="$srv"
+  done < <(examples_server_map "$pkg/examples/README.md")
+
+  local lint_files=() run_files=() lintonly=0 base rel
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rel="examples/$(basename "$f")"
+    base="$(basename "$f")"
+    lint_files+=("$rel")
+    # decide run vs lint-only
+    if [[ "$base" == _* || "$base" == bootstrap.php ]]; then
+      lintonly=$((lintonly+1)); continue            # helper/include
+    fi
+    if [ -z "${SERVER[$base]:-}" ]; then
+      lintonly=$((lintonly+1)); continue            # not a documented table row
+    fi
+    if [ "${SERVER[$base]}" = "yes" ]; then
+      lintonly=$((lintonly+1)); continue            # needs a server
+    fi
+    run_files+=("$rel")
+  done <<< "$files"
+
+  # build the in-container runner
+  local LINT="${lint_files[*]}" RUN="${run_files[*]}"
+  local runner="rc=0
+for f in $LINT; do php -l \"\$f\" >/dev/null 2>&1 || { echo \"LINTFAIL \$f\"; rc=1; }; done
+"
+  if [ -n "$RUN" ]; then
+    runner+="if [ -f vendor/autoload.php ]; then
+for f in $RUN; do if ! msg=\$(php \"\$f\" 2>&1 >/dev/null); then echo \"RUNFAIL \$f\"; printf '%s\\n' \"\$msg\" | tail -2 | sed 's/^/      /'; rc=1; fi; done
+else echo NOVENDOR; fi
+"
+  fi
+  runner+="exit \$rc"
+
+  # Mount the monorepo ROOT, not just the package: path-repo siblings are
+  # symlinked into vendor/ as ../../../<sibling>, which dangle if only the
+  # package dir is mounted (breaks core+backend pairs). Workdir = package subdir.
+  local out tmo=() rel
+  command -v timeout >/dev/null 2>&1 && tmo=(timeout 120)
+  rel="${pkg#"$REPO_ROOT"/}"
+  if [ "$rel" != "$pkg" ]; then
+    out="$("${tmo[@]}" docker run --rm -v "$REPO_ROOT":/repo -w "/repo/$rel" composer:2 sh -lc "$runner" 2>&1)"
+  else
+    out="$("${tmo[@]}" docker run --rm -v "$pkg":/app -w /app composer:2 sh -lc "$runner" 2>&1)"
+  fi
+  local e=0 w=0 detail=""
+  if grep -q '^NOVENDOR' <<< "$out"; then
+    w=1; warn "examples not executed: vendor/autoload.php missing (run composer install)"; detail="lint-only: vendor missing"
+  fi
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      LINTFAIL*) e=$((e+1)); err "example lint failed: ${line#LINTFAIL }" ;;
+      RUNFAIL*)  e=$((e+1)); err "example fatal at runtime: ${line#RUNFAIL }" ;;
+    esac
+  done <<< "$out"
+  [ "$e" -gt 0 ] && detail="$(grep -E '^(LINTFAIL|RUNFAIL)' <<< "$out" | sed -E 's/^(LINTFAIL|RUNFAIL) //' | tr '\n' ' ')"
+  [ "$e" -eq 0 ] && [ -z "$detail" ] && detail="(${#run_files[@]} run, $lintonly lint-only)"
+  check_line "examples" "$e" "$w" "$detail"
+}
+
+# ── package discovery ─────────────────────────────────────────────────────────
+is_application() {
+  grep -qE '"type"[[:space:]]*:[[:space:]]*"project"' "$1/composer.json" 2>/dev/null
+}
+
+discover_packages() {
+  local d
+  for d in "$REPO_ROOT"/*/; do
+    [ "$(basename "$d")" = "templates" ] && continue
+    [ -f "$d/composer.json" ] || continue
+    grep -qE '"name"[[:space:]]*:[[:space:]]*"rasuvaeff/' "$d/composer.json" || continue
+    printf '%s\n' "${d%/}"
+  done
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+main() {
+  case "${1:-}" in
+    -h|--help)
+      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+  esac
+
+  local -a targets=()
+  if [ "$#" -eq 0 ] || [ "${1:-}" = "--all" ]; then
+    while IFS= read -r p; do targets+=("$p"); done < <(discover_packages)
+  else
+    targets=("$@")
+  fi
+
+  local rc=0 pass=0 fail=0
+  for p in "${targets[@]}"; do
+    if [ ! -d "$p" ] || [ ! -f "$p/composer.json" ]; then
+      printf '%sskip%s %s (not a package directory)\n' "$C_YEL" "$C_RST" "$p"
+      continue
+    fi
+    if audit_one "$p"; then pass=$((pass+1)); else fail=$((fail+1)); rc=1; fi
+  done
+
+  if [ "$((pass+fail))" -gt 1 ]; then
+    printf '%s──────── %d package(s): %d pass, %d fail ────────%s\n' \
+      "$C_BLD" "$((pass+fail))" "$pass" "$fail" "$C_RST"
+  fi
+  exit "$rc"
+}
+
+main "$@"

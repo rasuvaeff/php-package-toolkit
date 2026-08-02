@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Applies testo/bench infrastructure to a package directory.
+# Usage: bin/add-benchmarks-infra <package-dir>
+set -euo pipefail
+
+PKG_DIR="${1:?Usage: $0 <package-dir>}"
+cd "$PKG_DIR"
+
+echo "→ $PKG_DIR"
+
+# Extract Pascal namespace from existing autoload-dev (e.g. "Rasuvaeff\\Foo\\Tests\\" → "Foo")
+PASCAL=$(grep -o '"Rasuvaeff\\\\[^\\]*\\\\Tests' composer.json | head -1 | sed 's|"Rasuvaeff\\\\||;s|\\\\Tests||')
+if [ -z "$PASCAL" ]; then
+    echo "  SKIP: cannot detect namespace in $PWD/composer.json"
+    exit 0
+fi
+echo "  Pascal: $PASCAL"
+
+# 1. testo/bench in require-dev
+if ! grep -q '"testo/bench"' composer.json; then
+    sed -i 's|"roave/backward-compatibility-check": "\^8\.0",|"roave/backward-compatibility-check": "^8.0",\n        "testo/bench": "^0.1.5",|' composer.json
+fi
+
+# 2. benchmarks/ in autoload-dev  (insert line before Tests line)
+if ! grep -q 'benchmarks/' composer.json; then
+    TESTS_PATTERN="\"Rasuvaeff\\\\\\\\${PASCAL}\\\\\\\\Tests\\\\\\\\\""
+    BENCH_LINE="            \"Rasuvaeff\\\\\\\\${PASCAL}\\\\\\\\Benchmarks\\\\\\\\\": \"benchmarks/\","
+    sed -i "/${TESTS_PATTERN}/i\\${BENCH_LINE}" composer.json
+fi
+
+# 3. bench script
+if ! grep -q '"bench"' composer.json; then
+    sed -i 's|"bc-check": "roave-backward-compatibility-check",|"bc-check": "roave-backward-compatibility-check",\n        "bench": "testo -vv",|' composer.json
+fi
+
+# 4. testo.php
+if [ ! -f testo.php ]; then
+    cp "${MONOREPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/templates/testo.php" testo.php
+fi
+
+# 5. benchmarks/ directory
+mkdir -p benchmarks
+
+# 6. .php-cs-fixer.php — add benchmarks/ before src/
+if [ -f .php-cs-fixer.php ] && ! grep -q "benchmarks" .php-cs-fixer.php; then
+    sed -i "s|__DIR__ . '/src'|__DIR__ . '/benchmarks',\n        __DIR__ . '/src'|" .php-cs-fixer.php
+fi
+
+# 7. Makefile — add bench target
+if [ -f Makefile ] && ! grep -q '^bench:' Makefile; then
+    sed -i '/^build:$/i bench:\n\t$(DOCKER) composer bench\n' Makefile
+    sed -i 's/^\.PHONY: build /\.PHONY: bench build /' Makefile
+fi
+
+echo "  done"

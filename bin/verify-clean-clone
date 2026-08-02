@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#
+# verify-clean-clone — post-publish sanity check: clone a just-published
+# rasuvaeff/* package fresh from GitHub and run composer install + build
+# against it, exactly as a first-time consumer would.
+#
+# Usage:
+#   bin/verify-clean-clone <package-name>          clone git@github.com:rasuvaeff/<name>.git
+#   bin/verify-clean-clone <owner>/<repo>           clone git@github.com:<owner>/<repo>.git
+#   bin/verify-clean-clone <git-url>                clone as given (ssh or https)
+#   bin/verify-clean-clone <package-name> --https   use https instead of ssh
+#
+# Exit code: 0 if install+build both pass, 1 otherwise. The clone always
+# happens under a fresh temp dir, removed on exit regardless of outcome.
+
+set -uo pipefail
+
+if [ "$#" -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+arg="$1"
+use_https=0
+[ "${2:-}" = "--https" ] && use_https=1
+
+case "$arg" in
+    git@*|https://*|http://*)
+        url="$arg" ;;
+    */*)
+        if [ "$use_https" -eq 1 ]; then
+            url="https://github.com/$arg.git"
+        else
+            url="git@github.com:$arg.git"
+        fi ;;
+    *)
+        if [ "$use_https" -eq 1 ]; then
+            url="https://github.com/rasuvaeff/$arg.git"
+        else
+            url="git@github.com:rasuvaeff/$arg.git"
+        fi ;;
+esac
+
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/verify-clean-clone.XXXXXX")"
+cleanup() {
+    # composer install runs as root inside the container, so files under
+    # $workdir/pkg/vendor are root-owned on the host — a plain `rm -rf` from
+    # the host user fails with Permission denied. Remove them the same way
+    # they were created: root, inside a container with the dir mounted.
+    docker run --rm --entrypoint rm -v "$workdir":/cleanup composer:2 -rf /cleanup >/dev/null 2>&1
+    rm -rf "$workdir"
+}
+trap cleanup EXIT
+
+echo "Cloning $url ..."
+if ! git clone --quiet "$url" "$workdir/pkg" 2>&1; then
+    echo "FAIL clone: could not clone $url" >&2
+    exit 1
+fi
+
+echo "composer install ..."
+if ! docker run --rm -v "$workdir/pkg":/app -w /app composer:2 composer install 2>&1; then
+    echo "FAIL: composer install" >&2
+    exit 1
+fi
+
+echo "composer build ..."
+if ! docker run --rm -v "$workdir/pkg":/app -w /app composer:2 composer build 2>&1; then
+    echo "FAIL: composer build" >&2
+    exit 1
+fi
+
+echo "PASS: clean clone of $url installs and builds green"

@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+#
+# dev-self-test — smoke tests for bin/dev on a /tmp fixture workspace.
+# No bats: plain bash + assert helpers. Must be green before every change
+# to bin/dev or bin/dev-lib/.
+
+set -uo pipefail
+
+DEV_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEV="$DEV_BIN_DIR/dev"
+
+PASS=0
+FAIL=0
+
+assert_eq() { # actual expected label
+  if [ "$1" = "$2" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL %s\n  expected: %q\n  actual:   %q\n' "$3" "$2" "$1" >&2
+  fi
+}
+
+assert_exit() { # actual_rc expected_rc label
+  if [ "$1" -eq "$2" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL %s\n  expected exit %d, got %d\n' "$3" "$2" "$1" >&2
+  fi
+}
+
+# ── fixture workspace ─────────────────────────────────────────────────────────
+FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/dev-test-workspace.XXXXXX")"
+trap 'rm -rf "$FIXTURE"' EXIT
+
+make_pkg() { # name composer_name
+  mkdir -p "$FIXTURE/$1/src"
+  printf '{"name": "%s"}\n' "$2" >"$FIXTURE/$1/composer.json"
+  printf 'build:\n\t@echo built-%s\n' "$1" >"$FIXTURE/$1/Makefile"
+  printf '# Changelog\n\n## 1.0.0 — 2026-01-01\n\n- Initial release.\n' >"$FIXTURE/$1/CHANGELOG.md"
+  git -C "$FIXTURE/$1" init -q -b master
+  git -C "$FIXTURE/$1" config user.email test@test
+  git -C "$FIXTURE/$1" config user.name test
+  git -C "$FIXTURE/$1" add -A
+  git -C "$FIXTURE/$1" commit -q -m 'Initial skeleton'
+}
+
+make_pkg pkg-a rasuvaeff/pkg-a
+make_pkg pkg-b rasuvaeff/pkg-b
+make_pkg yii3-outbox rasuvaeff/yii3-outbox
+make_pkg yii3-outbox-db rasuvaeff/yii3-outbox-db
+make_pkg templates 'rasuvaeff/{{PACKAGE_KEBAB}}'
+mkdir -p "$FIXTURE/docs" # no composer.json
+
+printf 'template rules v1\n' >"$FIXTURE/templates/.php-cs-fixer.php"
+printf 'root = true\n' >"$FIXTURE/templates/.editorconfig"
+mkdir -p "$FIXTURE/replicate"
+printf 'REPLICATE_FILES=(\n  .php-cs-fixer.php\n  .editorconfig\n)\n' >"$FIXTURE/replicate/manifest.bash"
+
+export DEV_WORKSPACE_ROOT="$FIXTURE"
+
+# ── test_selector ─────────────────────────────────────────────────────────────
+assert_eq "$("$DEV" list)" $'pkg-a\npkg-b\nyii3-outbox\nyii3-outbox-db' \
+  'selector: empty = all packages, templates/ and docs/ excluded'
+
+assert_eq "$("$DEV" list 'pkg-a,pkg-b')" $'pkg-a\npkg-b' \
+  'selector: explicit comma list'
+
+assert_eq "$("$DEV" list 'yii3-outbox*')" $'yii3-outbox\nyii3-outbox-db' \
+  'selector: glob'
+
+assert_eq "$("$DEV" list @outbox)" $'yii3-outbox\nyii3-outbox-db' \
+  'selector: alias @outbox'
+
+assert_eq "$("$DEV" list 'pkg-a,pkg-*')" $'pkg-a\npkg-b' \
+  'selector: duplicates removed, order preserved'
+
+"$DEV" list 'no-such-pkg*' >/dev/null 2>&1
+assert_exit $? 1 'selector: no match is an error'
+
+"$DEV" list @nope >/dev/null 2>&1
+assert_exit $? 1 'selector: unknown alias is an error'
+
+"$DEV" no-such-command >/dev/null 2>&1
+assert_exit $? 1 'dispatcher: unknown command is an error'
+
+# ── parallel runner smoke (dev_exec_in_packages) ──────────────────────────────
+run_exec() { # cmd — runs the parallel runner over all fixture packages
+  bash -c '
+    set -uo pipefail
+    WORKSPACE_ROOT="'"$FIXTURE"'"
+    source "'"$DEV_BIN_DIR"'/dev-lib/aliases.bash"
+    source "'"$DEV_BIN_DIR"'/dev-lib/common.bash"
+    mapfile -t pkgs < <(dev_list_packages)
+    dev_exec_in_packages "$1" "${pkgs[@]}"
+  ' _ "$1" 2>/dev/null
+}
+
+out="$(run_exec 'echo "hi from $(basename "$PWD")"')"
+assert_exit $? 0 'runner: all-green summary exit 0'
+assert_eq "$(grep -c 'hi from' <<<"$out")" 4 'runner: command ran in each package'
+assert_eq "$(grep -c '^=== ' <<<"$out")" 4 'runner: per-package block headers'
+
+run_exec '[ "$(basename "$PWD")" != pkg-b ]' >/dev/null
+assert_exit $? 1 'runner: one failing package makes summary exit non-zero'
+
+# ── test_exec_parallel: exec CLI + sugar ──────────────────────────────────────
+out="$("$DEV" exec 'echo hi' 'pkg-*' 2>/dev/null)"
+assert_exit $? 0 'exec: summary exit 0 when all packages green'
+assert_eq "$(grep -c '^hi$' <<<"$out")" 2 'exec: command ran in each selected package'
+
+"$DEV" exec 'false' pkg-a >/dev/null 2>&1
+assert_exit $? 1 'exec: failing package → non-zero summary exit'
+
+out="$("$DEV" build pkg-a 2>/dev/null)"
+assert_exit $? 0 'sugar: build = exec "make build"'
+assert_eq "$(grep -c '^built-pkg-a$' <<<"$out")" 1 'sugar: make target ran'
+
+# ── test_git: status / checkout / commit / push / pull ───────────────────────
+"$DEV" git:status 'pkg-*' >/dev/null 2>&1
+assert_exit $? 0 'git:status: all clean → exit 0'
+
+echo dirty >"$FIXTURE/pkg-a/src/new.txt"
+
+out="$("$DEV" git:status 'pkg-*' 2>/dev/null)"
+assert_exit $? 1 'git:status: dirty tree → non-zero exit'
+assert_eq "$(grep -c 'dirty' <<<"$out")" 1 'git:status: exactly one package marked dirty'
+
+"$DEV" git:checkout -b feature 'pkg-*' >/dev/null 2>&1
+assert_exit $? 1 'git:checkout: dirty tree without --stash aborts'
+assert_eq "$(git -C "$FIXTURE/pkg-b" rev-parse --abbrev-ref HEAD)" master \
+  'git:checkout: abort switched nothing'
+
+"$DEV" git:checkout -b feature 'pkg-*' --stash >/dev/null 2>&1
+assert_exit $? 0 'git:checkout: -b with --stash succeeds'
+assert_eq "$(git -C "$FIXTURE/pkg-a" rev-parse --abbrev-ref HEAD)" feature \
+  'git:checkout: pkg-a on the new branch'
+assert_eq "$(cat "$FIXTURE/pkg-a/src/new.txt")" dirty \
+  'git:checkout: dirty file survived stash push/pop'
+
+"$DEV" git:commit 'Test commit' 'pkg-*' --dry-run >/dev/null 2>&1
+assert_exit $? 0 'git:commit: --dry-run exit 0'
+assert_eq "$(git -C "$FIXTURE/pkg-a" log -1 --format=%s)" 'Initial skeleton' \
+  'git:commit: --dry-run committed nothing'
+
+"$DEV" git:commit 'Test commit' 'pkg-*' >/dev/null 2>&1
+assert_exit $? 0 'git:commit: exit 0'
+assert_eq "$(git -C "$FIXTURE/pkg-a" log -1 --format=%s)" 'Test commit' \
+  'git:commit: dirty package committed'
+assert_eq "$(git -C "$FIXTURE/pkg-b" log -1 --format=%s)" 'Initial skeleton' \
+  'git:commit: clean package skipped'
+
+git init -q --bare "$FIXTURE/origin-pkg-a.git"
+git -C "$FIXTURE/pkg-a" remote add origin "$FIXTURE/origin-pkg-a.git"
+
+"$DEV" git:push pkg-a --dry-run >/dev/null 2>&1
+assert_exit $? 0 'git:push: --dry-run exit 0'
+git -C "$FIXTURE/origin-pkg-a.git" rev-parse -q --verify feature >/dev/null
+assert_exit $? 1 'git:push: --dry-run pushed nothing'
+
+"$DEV" git:push pkg-a >/dev/null 2>&1
+assert_exit $? 0 'git:push: exit 0'
+assert_eq "$(git -C "$FIXTURE/origin-pkg-a.git" rev-parse feature)" \
+  "$(git -C "$FIXTURE/pkg-a" rev-parse feature)" \
+  'git:push: freshly created branch landed on origin'
+
+"$DEV" git:push pkg-b >/dev/null 2>&1
+assert_exit $? 1 'git:push: no origin remote → fail'
+
+"$DEV" git:pull pkg-a >/dev/null 2>&1
+assert_exit $? 0 'git:pull: --ff-only up-to-date exit 0'
+
+# ── test_replicate: check / files / drift / copy-file ────────────────────────
+"$DEV" replicate:check 'pkg-*' >/dev/null 2>&1
+assert_exit $? 1 'replicate:check: missing files → non-zero (drift)'
+
+"$DEV" replicate:files 'pkg-*' --dry-run >/dev/null 2>&1
+assert_exit $? 0 'replicate:files: --dry-run exit 0'
+[ ! -f "$FIXTURE/pkg-a/.php-cs-fixer.php" ]
+assert_exit $? 0 'replicate:files: --dry-run copied nothing'
+
+"$DEV" replicate:files 'pkg-*' >/dev/null 2>&1
+assert_exit $? 0 'replicate:files: exit 0'
+"$DEV" replicate:check 'pkg-*' >/dev/null 2>&1
+assert_exit $? 0 'replicate:check: green after replicate:files'
+assert_eq "$(cat "$FIXTURE/pkg-b/.editorconfig")" 'root = true' \
+  'replicate:files: file content matches template'
+
+echo 'local drift' >>"$FIXTURE/pkg-a/.php-cs-fixer.php"
+out="$("$DEV" replicate:check 'pkg-*' 2>/dev/null)"
+assert_exit $? 1 'replicate:check: manual edit detected as drift'
+assert_eq "$(grep -c 'drift' <<<"$out")" 1 'replicate:check: only the edited package reported'
+
+"$DEV" replicate:files 'pkg-*' >/dev/null 2>&1
+"$DEV" replicate:check 'pkg-*' >/dev/null 2>&1
+assert_exit $? 0 'replicate:files: drift repaired, check green again'
+
+"$DEV" replicate:copy-file templates/.editorconfig sub/dir/.editorconfig pkg-a >/dev/null 2>&1
+assert_exit $? 0 'replicate:copy-file: exit 0'
+assert_eq "$(cat "$FIXTURE/pkg-a/sub/dir/.editorconfig")" 'root = true' \
+  'replicate:copy-file: ad-hoc file landed at dst path'
+
+# ── test_changelog_add ────────────────────────────────────────────────────────
+"$DEV" changelog:add 'New feature.' --type=added 'pkg-*' --dry-run >/dev/null 2>&1
+assert_exit $? 0 'changelog:add: --dry-run exit 0'
+grep -q 'New feature.' "$FIXTURE/pkg-a/CHANGELOG.md"
+assert_exit $? 1 'changelog:add: --dry-run wrote nothing'
+
+"$DEV" changelog:add 'New feature.' --type=added 'pkg-*' >/dev/null 2>&1
+assert_exit $? 0 'changelog:add: exit 0'
+assert_eq "$(sed -n '3,7p' "$FIXTURE/pkg-a/CHANGELOG.md")" \
+  $'## Unreleased\n\n### Added\n\n- New feature.' \
+  'changelog:add: Unreleased section created before first version heading'
+
+"$DEV" changelog:add 'New feature.' --type=added 'pkg-*' >/dev/null 2>&1
+assert_exit $? 0 'changelog:add: idempotent re-run exit 0'
+assert_eq "$(grep -c 'New feature.' "$FIXTURE/pkg-a/CHANGELOG.md")" 1 \
+  'changelog:add: duplicate entry not added'
+
+"$DEV" changelog:add 'Second feature.' --type=added pkg-a >/dev/null 2>&1
+assert_eq "$(grep -A1 'New feature.' "$FIXTURE/pkg-a/CHANGELOG.md" | tail -1)" '- Second feature.' \
+  'changelog:add: appended to existing ### Added subsection'
+
+"$DEV" changelog:add 'Bug fix.' --type=fixed pkg-a >/dev/null 2>&1
+grep -q '### Fixed' "$FIXTURE/pkg-a/CHANGELOG.md"
+assert_exit $? 0 'changelog:add: new subsection added into existing Unreleased'
+assert_eq "$(grep -c '## Unreleased' "$FIXTURE/pkg-a/CHANGELOG.md")" 1 \
+  'changelog:add: Unreleased section not duplicated'
+
+"$DEV" changelog:add 'X.' --type=bogus pkg-a >/dev/null 2>&1
+assert_exit $? 1 'changelog:add: invalid --type rejected'
+
+rm "$FIXTURE/pkg-b/CHANGELOG.md"
+"$DEV" changelog:add 'Y.' pkg-b >/dev/null 2>&1
+assert_exit $? 1 'changelog:add: missing CHANGELOG.md → fail'
+
+# ── summary ───────────────────────────────────────────────────────────────────
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

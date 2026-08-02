@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# dev — batch operations over rasuvaeff/* packages in this workspace.
+#
+# Usage:
+#   bin/dev <command> [args] [selector] [options]
+#
+# Commands:
+#   list [pkgs]                        print package names matching the selector
+#   aliases                            print family aliases with globs and match counts
+#   exec "<cmd>" [pkgs]                run a shell command in each package (parallel)
+#   build|test|cs-fix|psalm [pkgs]     sugar for exec "make <target>"
+#   git:status [pkgs]                  pkg: branch [*dirty], summary at the end
+#   git:branch [pkgs]                  branches per repo, * marks current
+#   git:checkout [-b] <br> [pkgs]      switch/create branch in each repo
+#   git:commit "<msg>" [pkgs]          git add -A && git commit (clean pkgs skipped)
+#   git:push [pkgs]                    git push -u origin HEAD
+#   git:pull [pkgs]                    git pull --ff-only
+#   replicate:check [pkgs]             non-zero exit on drift from templates/ (manifest)
+#   replicate:files [pkgs]             copy manifest files from templates/ into packages
+#   replicate:copy-file <src> <dst> [pkgs]   ad-hoc copy of one file into packages
+#   changelog:add "<entry>" [pkgs]     add entry to ## Unreleased (--type=changed by default)
+#   help                               this help
+#
+# Selector:
+#   (empty)          all packages
+#   pkg-a,pkg-b      explicit list
+#   'yii3-outbox*'   glob (quote it)
+#   @<family>        family alias (see: bin/dev aliases)
+#   Forms are combinable via commas: '@outbox,yii3-webhooks*'
+#
+# Options:
+#   --dry-run   print the plan without mutating (git:*, replicate:*, changelog:*)
+#   --stash     git:checkout: stash dirty trees, pop after switching
+#   --type=T    changelog:add: added|changed|fixed|removed|breaking (default: changed)
+#   --serial    run exec-style commands one package at a time
+#   -jN         parallelism for exec-style commands (default: nproc)
+#
+# Env:
+#   DEV_WORKSPACE_ROOT   override workspace root (used by bin/dev-self-test)
+#   DEV_JOBS, DEV_SERIAL same as -jN / --serial
+
+set -uo pipefail
+
+DEV_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="${DEV_WORKSPACE_ROOT:-$(cd "$DEV_BIN_DIR/.." && pwd)}"
+
+source "$DEV_BIN_DIR/dev-lib/aliases.bash"
+source "$DEV_BIN_DIR/dev-lib/common.bash"
+
+usage() {
+  awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+}
+
+cmd="${1:-help}"
+shift || true
+
+DEV_DRY_RUN=0
+DEV_STASH=0
+DEV_TYPE=''
+POSARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DEV_DRY_RUN=1 ;;
+    --stash) DEV_STASH=1 ;;
+    --serial) DEV_SERIAL=1 ;;
+    --type=*) DEV_TYPE="${arg#--type=}" ;;
+    -j[0-9]*) DEV_JOBS="${arg#-j}" ;;
+    *) POSARGS+=("$arg") ;;
+  esac
+done
+
+case "$cmd" in
+  list)
+    dev_expand_selector "${POSARGS[0]:-}"
+    ;;
+  aliases)
+    for a in $(printf '%s\n' "${!DEV_ALIASES[@]}" | sort); do
+      printf '%-14s %-24s %d\n' "$a" "${DEV_ALIASES[$a]}" \
+        "$(dev_expand_selector "$a" | wc -l)"
+    done
+    ;;
+  exec)
+    source "$DEV_BIN_DIR/dev-lib/exec.bash"
+    cmd_exec
+    ;;
+  build | test | cs-fix | psalm)
+    source "$DEV_BIN_DIR/dev-lib/exec.bash"
+    cmd_make_target "$cmd"
+    ;;
+  git:status | git:branch | git:checkout | git:commit | git:push | git:pull)
+    source "$DEV_BIN_DIR/dev-lib/git.bash"
+    "cmd_${cmd/:/_}"
+    ;;
+  replicate:check | replicate:files | replicate:copy-file)
+    source "$DEV_BIN_DIR/dev-lib/replicate.bash"
+    cmd="${cmd/:/_}"
+    "cmd_${cmd//-/_}"
+    ;;
+  changelog:add)
+    source "$DEV_BIN_DIR/dev-lib/changelog.bash"
+    cmd_changelog_add
+    ;;
+  help | --help | -h)
+    usage
+    ;;
+  *)
+    dev_die "unknown command '$cmd' (see: bin/dev help)"
+    ;;
+esac
