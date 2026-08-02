@@ -28,4 +28,7 @@
 # AND the template is its canonical source.
 REPLICATE_FILES=(
   .editorconfig
+  .github/ISSUE_TEMPLATE/bug_report.yml
+  .github/ISSUE_TEMPLATE/feature_request.yml
+  .github/ISSUE_TEMPLATE/config.yml
 )
