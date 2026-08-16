@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+#
+# Merges a family of config-plugin packages the way a real Yii3 application
+# does, and fails on a `yiisoft/config` duplicate key.
+#
+# `config/di.php` and `config/params.php` are covered by neither cs, nor psalm,
+# nor a package's own test suite — and a package cannot see its siblings at all.
+# The failure this exists to catch is therefore invisible until an application
+# installs two of them together: two vendor packages defining one key in one
+# group is a fatal `Duplicate key` by design, and the only way to know it does
+# not happen is to perform the merge.
+#
+# It builds a throwaway application requiring the given packages through path
+# repositories, lets the config plugin write a real merge plan, and builds
+# `Config` with the same modifiers `yiisoft/yii-runner` uses — `params` merged
+# recursively, which is what lets two packages each name console commands under
+# one top-level key.
+#
+# Usage:
+#   bin/config-merge-harness <pkg> [<pkg> …]     # directory names in this repo
+#   bin/config-merge-harness @filestorage        # a family alias from bin/dev
+#   bin/config-merge-harness @filestorage --with=yiisoft/cache:^3.2
+#
+# `--with` adds a package the *application* would supply. Libraries requiring a
+# virtual package (`psr/simple-cache-implementation`, `psr/http-factory-...`)
+# deliberately do not pick the implementation; the harness is the application
+# here, so it has to. Repeatable.
+#
+# Exit codes: 0 merge is clean, 1 duplicate key or another merge failure,
+# 2 usage or environment error.
+
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+die() { printf '%s\n' "$*" >&2; exit 2; }
+
+[ $# -ge 1 ] || die "usage: $(basename "$0") <pkg> [<pkg> …]"
+
+packages=()
+extras=()
+keep=0
+for arg in "$@"; do
+    case "$arg" in
+        --keep)
+            keep=1
+            ;;
+        --with=*)
+            spec="${arg#--with=}"
+            case "$spec" in
+                *:*) extras+=("${spec%%:*}" "${spec#*:}") ;;
+                *) die "--with expects <package>:<constraint>, got \"$spec\"" ;;
+            esac
+            ;;
+        @*)
+            # Reuse bin/dev's family aliases rather than a second list that
+            # drifts from it.
+            while read -r name; do
+                [ -n "$name" ] && packages+=("$name")
+            done < <("$ROOT/bin/dev" list "$arg" 2>/dev/null || true)
+            [ ${#packages[@]} -gt 0 ] || die "alias \"$arg\" resolved to nothing"
+            ;;
+        *)
+            [ -d "$ROOT/$arg" ] || die "no such package directory: $arg"
+            packages+=("$arg")
+            ;;
+    esac
+done
+
+work="$(mktemp -d)"
+trap 'docker run --rm -v "$work":/w alpine:3 sh -c "rm -rf /w/vendor" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+
+# The application lives inside the monorepo so the path repositories resolve
+# with a relative URL, the same way each backend package already points at core.
+app="$ROOT/.config-merge-harness"
+# Through a container: a previous run's `vendor/` belongs to root, so a host
+# `rm -rf` fails halfway and leaves a half-deleted tree behind.
+docker run --rm -v "$ROOT":/repo alpine:3 sh -c 'rm -rf /repo/.config-merge-harness' >/dev/null 2>&1 || true
+mkdir -p "$app"
+cleanup() {
+    if [ "$keep" -eq 1 ]; then
+        printf 'Kept: %s\n' "$app"
+
+        return
+    fi
+    # The container writes vendor/ as root, so removing it needs a container.
+    docker run --rm -v "$ROOT":/repo -w /repo alpine:3 \
+        sh -c 'rm -rf /repo/.config-merge-harness' >/dev/null 2>&1 || true
+    rm -rf "$app" "$work"
+}
+trap cleanup EXIT
+
+{
+    printf '{\n  "name": "rasuvaeff/config-merge-harness",\n  "type": "project",\n'
+    printf '  "minimum-stability": "dev",\n  "prefer-stable": true,\n'
+    printf '  "repositories": [\n'
+    for i in "${!packages[@]}"; do
+        [ "$i" -gt 0 ] && printf ',\n'
+        printf '    {"type": "path", "url": "../%s", "options": {"symlink": false}}' "${packages[$i]}"
+    done
+    printf '\n  ],\n  "require": {\n    "yiisoft/config": "^1.6"'
+    for pkg in "${packages[@]}"; do
+        name="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['name'])" "$ROOT/$pkg/composer.json")"
+        printf ',\n    "%s": "*"' "$name"
+    done
+    for ((i = 0; i < ${#extras[@]}; i += 2)); do
+        printf ',\n    "%s": "%s"' "${extras[$i]}" "${extras[$((i + 1))]}"
+    done
+    printf '\n  },\n  "config": {"allow-plugins": {"yiisoft/config": true}}\n}\n'
+} > "$app/composer.json"
+
+cat > "$app/merge.php" <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+use Yiisoft\Config\Config;
+use Yiisoft\Config\ConfigPaths;
+use Yiisoft\Config\Modifier\RecursiveMerge;
+
+// The same modifier `Yiisoft\Yii\Runner\ApplicationRunner` applies. Without it
+// `yiisoft/config` refuses the *top-level* `yiisoft/yii-console` key the moment
+// a second package names a command — a duplicate no real application would
+// ever see, and one this harness must not invent.
+$config = new Config(
+    new ConfigPaths(__DIR__, ''),
+    null,
+    [RecursiveMerge::groups('params')],
+);
+
+$failures = 0;
+foreach (['params', 'di', 'di-console'] as $group) {
+    if (!$config->has($group)) {
+        printf("  %-11s absent\n", $group);
+
+        continue;
+    }
+
+    try {
+        $merged = $config->get($group);
+        printf("  %-11s ok — %d key%s\n", $group, count($merged), count($merged) === 1 ? '' : 's');
+    } catch (Throwable $e) {
+        $failures++;
+        printf("  %-11s FAILED — %s: %s\n", $group, $e::class, $e->getMessage());
+    }
+}
+
+exit($failures === 0 ? 0 : 1);
+PHP
+
+printf 'Packages: %s\n' "${packages[*]}"
+printf 'Installing…\n'
+if ! docker run --rm -v "$ROOT":/repo -w /repo/.config-merge-harness composer:2 sh -c \
+    'git config --global --add safe.directory "*"; composer install --no-interaction --no-progress' \
+    > "$work/install.log" 2>&1; then
+    printf 'composer install failed:\n' >&2
+    cat "$work/install.log" >&2
+    exit 2
+fi
+
+# The plan lands beside composer.json: a root package with no
+# `config-plugin-options.source-directory` has the project root *as* its config
+# directory, and this harness deliberately ships no application-layer config —
+# the vendor layer is what is under test.
+plan="$app/.merge-plan.php"
+[ -f "$plan" ] || die "the config plugin wrote no merge plan — is \"yiisoft/config\" allowed as a plugin?"
+
+printf 'Merge plan contributors:\n'
+grep -oE "'[a-z0-9._-]+/[a-z0-9._-]+' => \[" "$plan" | sort -u | sed "s/^/  /;s/ => \[$//"
+
+printf 'Merging…\n'
+if docker run --rm -v "$ROOT":/repo -w /repo/.config-merge-harness composer:2 php merge.php; then
+    printf 'Clean: no duplicate vendor keys.\n'
+else
+    printf 'Merge failed. Two vendor packages define one key in one group.\n' >&2
+    exit 1
+fi

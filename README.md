@@ -17,10 +17,10 @@ This is a **showcase, not a product.**
 - Nothing here is on Packagist. There is no versioning, no backwards-compatibility
   promise, and no support commitment.
 - It is published because the interesting part is not the code — it is the
-  answer to "how does one person keep 55 packages consistent, statically clean,
+  answer to "how does one person keep 66 packages consistent, statically clean,
   mutation-tested and release-safe?" That answer is a process, and this is the
   process, verbatim.
-- **It is a snapshot, taken 2026-08-02, not a mirror.** The working copy lives in
+- **It is a snapshot, taken 2026-08-16, not a mirror.** The working copy lives in
   a private monorepo and keeps moving; this repository is not expected to track
   it. Read it as a record of how the packages were built, not as the current
   state of anyone's build system. The packages themselves are the living
@@ -33,15 +33,16 @@ Copy anything you find useful. Expect to adapt it.
 | Path | What it is |
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | The rulebook. File set, code style, test conventions, CI requirements, security rules, naming, and the four end-to-end processes (create / build / review / publish a package) |
-| [`docs/evolved-rules.md`](docs/evolved-rules.md) | `ER-001` … `ER-046` — a numbered catalogue of concrete engineering gotchas found in production work: CI traps, static-analysis conflicts, mutation-testing quirks, DI wiring pitfalls, release-process incidents. Each entry records what broke, why, and the rule that came out of it |
+| [`docs/evolved-rules.md`](docs/evolved-rules.md) | `ER-001` … `ER-047` — a numbered catalogue of concrete engineering gotchas found in production work: CI traps, static-analysis conflicts, mutation-testing quirks, DI wiring pitfalls, release-process incidents. Each entry records what broke, why, and the rule that came out of it |
 | [`DEV-TOOL.md`](DEV-TOOL.md) | How to drive `bin/dev` |
 | [`templates/`](templates/) | The skeleton a new package is cut from: `composer.json`, psalm/rector/infection/php-cs-fixer configs, `Makefile`, hardened GitHub Actions workflows, branch-protection payload, doc stubs |
 | [`bin/dev`](bin/dev) + [`bin/dev-lib/`](bin/dev-lib/) | Batch operations across packages — parallel `exec`/`build`/`test`/`psalm`, batch git with `--dry-run`, batch CHANGELOG entries, template replication |
 | [`bin/package-audit`](bin/package-audit) | Deterministic per-package audit: required files, `@api`/`@internal` on every type, `#[Covers]` on every test class, no psalm suppressions, docs mention every public type, examples actually run |
 | [`bin/build-digest`](bin/build-digest) | Runs a composer script in Docker and prints one `PASS`/`FAIL` line instead of several hundred — the difference between a usable and an unusable agent session |
+| [`bin/config-merge-harness`](bin/config-merge-harness) | Merges a family of `config-plugin` packages the way a real Yii3 application does, and fails on a `yiisoft/config` duplicate key — the cross-package error no package-level test can see |
 | [`bin/verify-clean-clone`](bin/verify-clean-clone) | Clones a published package into a temp dir and builds it there, so "works on my machine" is never the claim |
 | [`bin/dev-self-test`](bin/dev-self-test) | A self-test suite for the batch tooling itself, run against a fixture workspace in `/tmp` |
-| [`.claude/`](.claude/) | The agent layer: five skills (create / build / review / publish / raise mutation score), a package-builder subagent, and two `PreToolUse` hooks — a bash-command guard and a pre-commit audit |
+| [`.claude/`](.claude/) | The agent layer: six skills (create / build / review / publish / raise mutation score / contribute upstream), a package-builder subagent, and two `PreToolUse` hooks — a bash-command guard and a pre-commit audit |
 | [`replicate/manifest.bash`](replicate/manifest.bash) | The short list of files that are meant to be byte-identical across packages. It is short on purpose — most template files diverge deliberately |
 
 ## The gates a package has to pass
@@ -61,7 +62,7 @@ Outside the build gate, because they need a coverage driver or a previous tag:
 | Check | Tool | Setting |
 |---|---|---|
 | Mutation testing | `infection/infection` via `testo/bridge-infection` | `minMsi` starts at 85 and is raised as a package matures |
-| Backwards compatibility | `roave/backward-compatibility-check` | required status check; a major release only passes when the CHANGELOG declares the major |
+| Backwards compatibility | `roave/backward-compatibility-check` | required status check; a release declaring an intentional compatibility boundary (a major, or a minor while below 1.0) in the CHANGELOG is the only one that may carry breaks |
 | Automated refactoring | `rector/rector` | dry-run in `release-check` |
 
 CI is hardened rather than convenient: every `uses:` is pinned to a 40-character
@@ -122,6 +123,9 @@ wrong. A sample of what is in there:
   every future pull request (`ER-046`).
 - `yiisoft/db-migration` matches PSR-4 namespaces by string prefix, lands in the
   wrong package, and returns "0 migrations" without an error (`ER-044`).
+- A fatal inside a test dies with a soundless `exit 255` — the runner's output
+  buffer swallows the error, and "the runner cannot do X" is the wrong
+  conclusion to write into the commit message (`ER-047`).
 
 Every entry carries its source and a status, and superseded entries stay in the
 file rather than being deleted.
