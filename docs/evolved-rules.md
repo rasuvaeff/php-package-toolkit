@@ -63,6 +63,21 @@ actually calls. Use `#[CoversNothing]` only for pure e2e smoke tests with no
 claim on the mutation score; before trusting a package's mutation gate for a
 class reachable only through an integration test, grep for `#[CoversNothing]`
 and re-check the real coverage.
+
+**Update 2026-08-02 (a measurement, not an argument):** the Infection metric
+does not merely stay silent — it reassures. `retry`, baseline: `Total: 307`,
+`Not Covered: 0`, `Mutation Code Coverage: 100%` — while `FixedBackoff`,
+`ImmediateBackoff`, `SystemRandomizer`, `SystemSleeper`, `FakeSleeper`,
+`JitterMode` are named in no `#[Covers]` at all. There is nothing to report
+as uncovered, because no mutants are generated there — not because they are
+killed. Two-line reproduction: add `#[Covers(FixedBackoff::class)]` +
+`#[Covers(ImmediateBackoff::class)]` to `RetryPolicyTest` (which already
+executes those classes), touching not a single assertion → `307 → 311`
+mutants. A workspace-wide audit (`bin/covers_audit.py`, report in
+`docs/mutation-blind-spots.md`): of 1015 types in `src/`, **91 across 32
+packages** carry real logic and zero mutants; 15 of them are reachable only
+through a `#[CoversNothing]` test. The worst case — `yii3-ab-testing-db`:
+`DbExperimentRepository` and six console commands.
 **Status:** active
 
 ### ER-004 — `#[Covers]` scoring does not save untested branches inside test code itself
@@ -595,7 +610,19 @@ Verified by a live repro (settings-db v2.0.1 + sqlite): `2.0.1 → found: 0`,
 `dev-master → found: 1` (the correct FQCN). But there is no release with the
 fix — the latest tag is 2.0.1 (2025-12-20), so users on `^2.0` stable are
 still broken.
-**Status:** active (waiting for an upstream release; after it, re-verify and lift the ban on documenting the recipe)
+**Update 2026-08-03/04:** the `yiisoft/db-migration` 2.1.0 release
+(2026-08-03) carries our PR #350; all nine `*-db` packages were bumped to
+`^2.1`, the `Injector` workaround was removed from their READMEs, and the
+`setSourceNamespaces()` recipe is documented again. Re-verified live once
+more on 2026-08-07 while building `yii3-filestorage-db`:
+`getNewMigrations()` → two FQCNs, `migrate:up` creates all three tables.
+The residue that stays as a rule: **a scenario the documentation promises
+the user must be exercised by a test exactly as documented.** For
+`yii3-filestorage-db` that is a dedicated `tests/Integration/SqliteIntegrationTest.php`
+suite run in CI by `composer test:integration` — `composer build` only runs
+Unit and would never see such a test. The boundary bug itself (trimmed-key
+`str_starts_with` + substr by the unstripped length) is what PR #350 closed.
+**Status:** resolved (require `^2.1`; document the recipe only together with a test that runs it)
 
 ---
 
@@ -904,3 +931,62 @@ PR, no release) when they actually hit it, rather than by a pre-emptive
 account-wide retrofit.
 
 **Status:** active
+
+### ER-047 — Silent exit 255 in testo: an E_ERROR inside the runner's output buffer dies without diagnostics
+
+**Date:** 2026-08-15 (found during work on `rasuvaeff/domain-monitor`, PR #38).
+
+**What happened.** A test method containing an anonymous class implementing
+an interface died with a fatal, and testo exited with `exit 255` — without a
+single line of output: no failed test, no exception, no parse error. It
+looked like "testo cannot handle anonymous classes", and that wrong
+explanation leaked into the commit message and the PR description.
+
+**Root cause — two layers:**
+
+1. The fatal itself was a bug in the test: the anonymous class method's
+   return type (`: DnsRecords`) without a `use Rasuvaeff\DomainMonitor\DnsRecords;`
+   in the `...\Tests\` namespace resolves to the non-existent
+   `...\Tests\DnsRecords`. Anonymous-class compilation is lazy; when checking
+   interface compatibility PHP throws the E_ERROR `Could not check
+   compatibility between ... because class ... is not available`. That is
+   normal PHP behaviour, not a test-runner bug.
+2. The silence is a testo UX defect: its output interceptor buffers the
+   test's output, and the E_ERROR kills the process together with the
+   unflushed buffer. The runner has no `register_shutdown_function` hook
+   printing `error_get_last()` to STDERR. Net effect: any
+   E_ERROR/E_PARSE/E_COMPILE_ERROR inside a test = a soundless `exit 255`
+   (the same class of problem jest/PHPUnit had before their
+   shutdown handlers).
+
+**Diagnostic trick.** `auto_prepend_file` with a shutdown handler writing
+to STDERR (whose stdout buffering cannot silence it):
+
+```php
+register_shutdown_function(static function (): void {
+    $e = error_get_last();
+    if ($e !== null && \in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        \fwrite(STDERR, sprintf("FATAL: %s at %s:%d\n", $e['message'], $e['file'], $e['line']));
+    }
+});
+```
+
+Run: `php -d auto_prepend_file=prepend.php vendor/bin/testo --suite=Unit`.
+The fatal is visible instantly; the minimal repro is a test class with two
+methods, the second holding an anonymous class with an unimported type (with
+a single method the class may never reach the second one, depending on
+discovery order — verify reproducibility on 2+ methods).
+
+**Rule.**
+
+| Situation | Action |
+|---|---|
+| testo `exit 255` with no output | Do not conclude "the runner cannot do X". First the STDERR shutdown handler — find the real fatal |
+| A claim about a tool's properties | Requires a minimal repro; "a silent failure ≠ the feature is missing" |
+| Upstream candidate | php-testo: a five-line shutdown handler in the runner turning the silent 255 into `FATAL: ... file:line`. Sending it — deferred |
+
+**Related:** ER-039 (file edits in Docker), ER-037 (empirically checking
+claims) — the shared pattern of "trusting a convenient explanation instead
+of a minimal repro".
+
+**Status:** active (the upstream testo issue is deferred — a note file until the decision)

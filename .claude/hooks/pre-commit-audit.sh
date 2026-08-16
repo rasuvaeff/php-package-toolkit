@@ -83,6 +83,13 @@ target_dir="$(cd "$target_dir" 2>/dev/null && pwd)"
 [ -n "$target_dir" ] || exit 0
 [ -f "$target_dir/composer.json" ] || exit 0
 
+# Only audit our own packages. A commit into an external repo (Phase 2
+# contributions: forks of yiisoft/*, etc.) has its own composer.json and its
+# own conventions that bin/package-audit has no business enforcing — mirrors
+# the same "rasuvaeff/" name filter bin/package-audit itself applies under
+# --all.
+grep -qE '"name"[[:space:]]*:[[:space:]]*"rasuvaeff/' "$target_dir/composer.json" || exit 0
+
 # Exempt the initial skeleton commit (create-php-package step 3: git init &&
 # git add -A && git commit, before src/tests/README/etc. exist) — audit only
 # once a package has at least one prior commit.

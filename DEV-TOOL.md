@@ -95,13 +95,14 @@ bin/dev replicate:files           # apply (copies only what differs)
 bin/dev replicate:copy-file templates/foo.md docs/foo.md @ab   # ad-hoc file into packages
 ```
 
-The manifest is `replicate/manifest.bash`. Right now it holds only
-`.editorconfig`: a 2026-07-11 audit found that the remaining template files
-differ between packages **deliberately** (rector `withSkip`, per-package
-Makefile/testo suites, and so on) — the reasons are listed in the manifest's
-comment. Before adding a file to the manifest, make sure of two things: it is
-meant to be identical in every package, AND the template is the canonical
-version.
+The manifest is `replicate/manifest.bash`. It holds the files that must stay
+byte-identical in every package: `.editorconfig`, the three
+`.github/ISSUE_TEMPLATE/` files and `.github/workflows/zizmor.yml`. A
+2026-07-11 audit found that the remaining template files differ between
+packages **deliberately** (rector `withSkip`, per-package Makefile/testo
+suites, and so on) — the reasons are listed in the manifest's comment. Before
+adding a file to the manifest, make sure of two things: it is meant to be
+identical in every package, AND the template is the canonical version.
 
 ## Options (summary)
 

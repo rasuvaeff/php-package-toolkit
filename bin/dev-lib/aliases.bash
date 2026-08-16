@@ -4,6 +4,7 @@ declare -A DEV_ALIASES=(
   [@ab]='yii3-ab-testing*'
   [@audit]='yii3-audit-log*'
   [@clickhouse]='*clickhouse-toolkit'
+  [@filestorage]='yii3-filestorage*'
   [@flags]='yii3-feature-flags*'
   [@idempotency]='yii3-idempotency*'
   [@mcp]='yii3-mcp*'
@@ -15,6 +16,9 @@ declare -A DEV_ALIASES=(
   [@tenancy]='yii3-tenancy*'
   [@webhooks]='yii3-webhooks*'
   [@workflow]='yii3-workflow*'
+  [@utm]='yii3-utm*'
+  [@property-testing]='property-testing*'
+
 )
 
 # Resolve @alias to its glob; non-zero if unknown.

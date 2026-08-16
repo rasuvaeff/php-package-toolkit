@@ -104,6 +104,7 @@ There is no PHP/Composer on the host — everything runs through Docker
         "friendsofphp/php-cs-fixer": "^3.95",
         "infection/infection": "^0.33",
         "maglnet/composer-require-checker": "^4.17",
+        "rasuvaeff/rector-named-literals": "^1.0",
         "rector/rector": "^2.4",
         "roave/backward-compatibility-check": "^8.0",
         "testo/bridge-infection": "^0.1.6",
@@ -117,8 +118,11 @@ Add extra dev dependencies only when integration tests need them (for example
 `yiisoft/db-sqlite` for SQLite tests, `guzzlehttp/guzzle` for HTTP).
 
 If the package contains code with algebraic laws or invariants (see
-"Property-based tests"), add `"rasuvaeff/property-testing": "^1.0"` to
-`require-dev` and `mbstring` to `extensions:` in every CI job.
+"Property-based tests"), add `"rasuvaeff/property-testing-testo": "^0.1"` to
+`require-dev` and `mbstring` to `extensions:` in every CI job. Install it with
+`-W` (`composer require --dev "rasuvaeff/property-testing-testo:^0.1" -W`) — see
+the dev-dependency row in "Property-based tests": without `-W` composer cannot
+resolve the `testo/testo` bump the adapter pulls in.
 
 ### Scripts (identical set)
 
@@ -162,11 +166,55 @@ The model is the one `yiisoft/cache` uses: the core does not bind the pluggable
 one backend and it works with no application config. Install two backends at once
 and you get a deliberate error (pick one).
 
-Verifying the merge without publishing a new major: reproduce it through the real
-`yiisoft/config` (a fake vendor layout plus a hand-written merge plan, run in
-Docker with `composer:2 php`). `config/di.php` is covered by neither cs (Finder =
-src/tests/examples), nor psalm (src-only), nor testo — `composer build` does not
-validate edits to it. Check it with `php -l` and the merge harness.
+Verifying the merge without publishing a new major: `bin/config-merge-harness`:
+
+```bash
+bin/config-merge-harness @filestorage --with=yiisoft/cache:^3.2 --with=yiisoft/db-sqlite:^2.0
+bin/config-merge-harness yii3-settings,yii3-settings-db
+```
+
+It builds a throwaway application requiring the given packages through path
+repositories, lets the config plugin write a real merge plan, and merges the
+`params`, `di`, `di-console` groups with the same modifiers `yiisoft/yii-runner`
+uses (`RecursiveMerge::groups('params')`). `--with` adds what a real
+application supplies itself (a `psr/simple-cache-implementation`
+implementation, a `yiisoft/db-implementation` driver); `--keep` leaves
+`.config-merge-harness/` behind for inspection.
+
+`config/di.php` and `config/params.php` are covered by neither cs (Finder =
+src/tests/examples), nor psalm (src-only), nor testo — `composer build` does
+not validate edits to them. Check them with `php -l` + a package-level
+`ConfigWiringTest` + this harness: no package-level test can see its
+siblings, and "two vendor packages on one key" is precisely an
+in-between-packages error.
+
+**The rule for every package with `config-plugin`:**
+
+| When | What to do |
+|---|---|
+| New package | A `ConfigWiringTest` (its own container) **plus** a `bin/config-merge-harness` run before the first release — right away, not "later" |
+| Editing `config/` in a published package | Run the harness in the same PR |
+| A family (core + backends) | Run it over the whole family, not one package: the "two vendor packages on one key" error only exists between them |
+| A README documents overriding a **foreign** DI key | A test that loads the `config/di.php` of both packages and executes the recipe end to end |
+
+A package-level `ConfigWiringTest` checks that *its own* `di.php` assembles
+in a container; it fundamentally cannot see siblings. The last table row is
+a separate error class the harness does not catch either: it merges the
+vendor layer, while a README recipe lives in the application layer.
+`yii3-filestorage-db` documented enabling deduplication through
+`StorageInterface::class => fn (DeduplicatingStorageFactory $f) => …`, and
+the factory requested `StorageInterface` to get the plain facade — i.e.
+itself. Every container answered `CircularReferenceException`, while both
+the harness and both `ConfigWiringTest`s were green: each loaded exactly one
+`di.php`. Caught by external review (CodeRabbit), 2026-08-08. The harness is
+the only place checking what the whole "one key — one vendor" discipline
+exists for.
+
+An empty contribution into a foreign top-level key
+(`'yiisoft/yii-console' => ['commands' => []]` in a package without
+commands) is not a harmless stub: it spends tolerance that exists only
+thanks to the runner's recursive `params` merge. Do not declare a key the
+package does not fill.
 
 ## Packages with migrations (`*-db`)
 
@@ -174,11 +222,15 @@ The full rule table (namespace placement, typed table-name VO, single source of
 the name, and so on) plus the pitfalls that come with moving migrations live in
 `docs/evolved-rules.md`, ER-027, ER-028, ER-029.
 
-⚠ **Registering migrations via `setSourceNamespaces()` does not work** in any of
-the nine `*-db` packages: `yiisoft/db-migration` matches the PSR-4 map by string
-prefix, lands in the core package, and `migrate:up` silently returns 0 without
-creating any tables. Do not document this recipe for users until upstream is
-fixed — details and the workaround are in `docs/evolved-rules.md`, ER-044.
+✅ **Registering migrations via `setSourceNamespaces()` works again** — with
+`yiisoft/db-migration` `^2.1` (2.1.0 carries our PR #350). Before 2.1.0 it
+silently found nothing in all nine `*-db` packages: the PSR-4 map match by
+string prefix landed in the core package, and `migrate:up` returned 0 without
+creating any tables. Require `^2.1` in `require` and document the recipe
+**only** where a test executes it: unit tests build migrations through
+`Injector::make()` and never touch that path at all. The reference
+implementation — `yii3-filestorage-db/tests/Integration/SqliteIntegrationTest.php`.
+Incident details — `docs/evolved-rules.md` ER-044.
 
 ## Code style
 
@@ -302,6 +354,8 @@ final class ClassUnderTestTest
 | `Assert::false` / `Assert::true` / `Assert::null` | Boolean/null checks |
 | `Assert::instanceOf($obj, Class::class)` | Type check (order: `actual, expected`) |
 | `Assert::string($s)->contains($n)` | String checks (chains) |
+| `Assert::json($body)->isObject()->hasKeys(...)->assertPath('$.a.b', fn(...))` | JSON responses (webhook payloads, JSON-RPC, OTLP export, problem+json) instead of a manual `json_decode` + `Assert::same`; accepts a `string` — cast PSR-7 bodies with `(string) $response->getBody()`. The path is JSONPath-like and must carry the `$`/`.` root (`'a.b'` throws `unexpected character 'a' in path`); indices are `$.a[0].b`. Inside the callback compare via `Assert::same($json->decode(), ...)`: `matchesType()` knows no literal types and `array{...}` is not sealed (extra keys pass), so replacing an exact comparison with a chain is a weakening of the assertion, not a refactor |
+| `#[ExpectNoAssertions]` | On tests of the "must not throw" kind (boot, migrations, initialization), so they do not fall into `Risky`. Method-level only (class-level is banned deliberately); do not combine with `Expect::exception()`/`#[ExpectException]` — the combination itself produces `Risky` |
 | `#[BeforeTest]`/`#[AfterTest]` | setUp/tearDown through lifecycle hooks (`Testo\Lifecycle`); the method name is free |
 | `#[CoversNothing]` | On integration tests |
 | `<ClassName>Test` | File name = class name |
@@ -311,9 +365,12 @@ With `#[Test]` on the class, public methods returning `array`/`iterable`
 
 ### Property-based tests
 
-For code with algebraic laws and invariants, use `rasuvaeff/property-testing`
-(a Testo plugin). A property test generates random inputs, hunts for a
-counterexample and shrinks it.
+For code with algebraic laws and invariants, use
+`rasuvaeff/property-testing-testo` (a Testo adapter over the framework-agnostic
+`rasuvaeff/property-testing-core` — the split family was published 2026-08-09;
+the frozen `rasuvaeff/property-testing` 2.x receives no new packages). A
+property test generates random inputs, hunts for a counterexample and shrinks
+it.
 
 **When to use it** (wherever hand-written cases cannot cover the input space):
 
@@ -325,8 +382,21 @@ counterexample and shrinks it.
 | Monotonicity / bounds | backoff delay ∈ `[0, cap]` and never decreases; rollout is monotonic in percentage |
 | Determinism | hash bucketing: the same subject always yields the same variant |
 | Aggregation | worst-of status does not depend on order |
+| Stateful / model-based | `Gen::commands()` + `StateMachine::check()` over **your own** code (a config→model factory, a marking store, an audit log) — not over the laws of a library under a wrapper (symfony/workflow and the like) |
+| Regex accept/reject | For static format assertions (`assert()`/`assertType()`-style, not VOs): the generator builds both valid and invalid strings from the alphabet without `Assume`; the property — `accept ⇔ preg_match(the same regex, x)` |
+| Serialization consistency | When a round-trip is impossible (no `fromArray`/`fromJson`): `json_decode(x->toJson(), true) ≡ x->toArray()`, determinism of two calls, mandatory fields present for any generated object |
+| Adapter property | For a bridge between a foreign library and your own interface — not the library's laws, but "the adapter neither loses nor invents the result": `adapter->result(x) ⇔ library->result(x)` |
 
-Glue, DI, adapters, UI and plain DB mappers are **not** property-test material.
+When the property's input is people (forms, profiles, authorization,
+validators, reports), use `rasuvaeff/property-testing-names` (`require-dev`,
+`^0.1`) instead of `Gen::string()`: `Names::first()`/`last()`/`middle()` give
+the individual parts, `Names::full()`/`person()` — all parts consistent for a
+single gender, locale `en`/`ru`, shrinking towards the dataset's shortest
+record.
+
+Glue, DI, adapters, UI and plain DB mappers are **not** property-test material
+(except the "adapter property" above — that is about preserving the result at
+the boundary, not about re-testing the library).
 
 **How to write them** (NOT a separate file — methods go into the existing
 `<Class>Test`, so `#[Covers]` is preserved):
@@ -356,14 +426,62 @@ public static function delayStaysWithinCapGenerators(): array
 | Rule | Details |
 |---|---|
 | `#[Property(runs: N)]` | The attribute from `Rasuvaeff\PropertyTesting\Property`; `runs` ≥ 1 (default 100) |
-| Generators | A `public static function <testMethod>Generators(): array` returning `['arg' => Gen::...]` keyed by parameter name. **Strictly public static** (rector's `RemoveUnusedPrivateMethodRector` deletes private ones — they are only ever called through reflection; public is untouched by every rule, and it does not become a test because it does not return `void`). `public` without `static` only when the body needs `$this`. There is NO `#[Given]` attribute |
-| `Gen::*` | `int`, `intBetween`, `intPositive`, `float`, `floatBetween`, `bool`, `string`, `stringAscii`, `stringOf`, `arrayOf`, `nonEmptyArrayOf`, `oneOf`, `nullable`, `map`, `flatMap`, `filter`, `tuple`, `frequency`; since 2.3.0 also `regex`/`stringMatching` (a PCRE subset), `ipv4`, `email`, `url`, `json` |
-| `Gen::draw($arb)` | Since 2.4.0: an in-body draw inside the property body for several dependent values (when a nested `flatMap` gets unwieldy). Only valid inside a property run (otherwise `RuntimeException`); it shows up in the counterexample as `draw#N` |
+| Generators | A `public static function <testMethod>Generators(): array` returning `['arg' => Gen::...]` keyed by parameter name. **Strictly public static** (rector's `RemoveUnusedPrivateMethodRector` deletes private ones — they are only ever called through reflection; public is untouched by every rule, and it does not become a test because it does not return `void`). `public` without `static` only when the body needs `$this`. There is NO `#[Given]` attribute. Since `-testo` ≥0.5 `generators`/`examples` in `#[Property]` also accept a callable — `[Provider::class, 'method']`, `'Provider::method'`, an invokable object (`new Provider()`) — for sets reused across test classes; a string resolves first as a method of its own class (a local method wins over a same-named global function) |
+| `Gen::*` | `int`, `intBetween`, `intPositive`, `float`, `floatBetween`, `bool`, `string`, `stringAscii`, `stringOf`, `stringFrom` (an alphabet without separators — for parser inputs), `bytes` (raw/HMAC), `arrayOf`, `nonEmptyArrayOf`, `uniqueArrayOf` (ids/keys), `dictOf` (header maps), `record` (typed VOs), `oneOf`, `elements`, `enum`, `frequency` (weighted choice), `nullable`, `map`, `flatMap`, `filter`, `tuple`, `recursive` (trees), `uuid`, `datetime`, `ipv4`, `email`, `url`, `json`, `jsonString`, `regex`/`stringMatching` (a PCRE subset), `commands` (for stateful) |
+| `Gen::draw($arb)` | An in-body draw inside the property body for several dependent values (when a nested `flatMap` gets unwieldy). Only valid inside a property run (otherwise `RuntimeException`); it shows up in the counterexample as `draw#N` |
+| `<method>Examples()` | A `public static function <testMethod>Examples(): iterable` returning named tuples of arguments, run **before** the random phase. Auto-discovered by name. Pins known edge cases found by mutations or audits — without them the regression holds on the random phase's dice alone |
+| `Classify::cover($cond, $label, $minPercent)` | A coverage gate: when the share of runs meeting the condition is below the threshold — `CoverageFailed`, even if every run passed. Required when the property body branches and every branch must be reached (delivery status, error categories, retry outcomes). `Classify::when($cond, $label)` / `Classify::label($label)` merely tag the distribution, no gate |
+| `#[Property(timeoutMs: N)]` | A wall-clock deadline for one run. Mandatory for regex/recursion tests — `DeadlineExceededException` catches catastrophic inputs before they hang CI. `budgetMs` is the budget of the whole random phase |
 | Construct, do not filter | Build dependent values (`$max = $n + $slack`) instead of discarding them through `Assume::that(...)` — otherwise a third of the runs is thrown away |
 | `Assume::that(bool)` | Only when construction is impossible (it warns above 90% discards) |
 | Helper generator | A `private static function xGenerator(): ArbitraryInterface` is fine — under `#[Test]` it does not become a test (it returns neither `void` nor `never`) |
 | CI: `ext-mbstring` | property-testing requires `mbstring` (plus `random`, core). Add `mbstring` to `extensions:` in every job of `build.yml`/`static-analysis.yml`, otherwise a local `composer build` is green while CI is red |
-| dev dependency | `"rasuvaeff/property-testing": "^1.0"` in `require-dev` |
+| dev dependency | `"rasuvaeff/property-testing-testo": "^0.1"` in `require-dev`. `composer require --dev "rasuvaeff/property-testing-testo:^0.1" -W` — without `-W` composer fails with "Your requirements could not be resolved" when a lock file holds `testo/testo` below the version the adapter requires (`^0.10.39 \|\| ^1.0`); `-W` allows bumping `testo/testo` and its satellites by minors. Verified live on `duration`/`retry`/`yii3-ab-testing` 2026-08-09 — `composer build` green without a single PHP-code edit |
+
+### Making the most of the property-testing API
+
+A workspace audit (2026-08-10) showed half of property-testing's public API
+unused by any package: `<method>Examples()`, `Gen::regex`/`stringMatching`,
+`Gen::datetime`/`bytes`/`uniqueArrayOf`/`record`/`dictOf`, `Gen::commands` +
+`StateMachine` (one package only), `Classify::when`/`label` (`cover` only),
+`Assume::that`, `#[Property(timeoutMs:`/`budgetMs:`)]. Agents and people use
+what they remember — the rest idles. This rule closes the gap.
+
+**Trigger.** When adding a new property test or extending an existing one in
+any package with `rasuvaeff/property-testing*` in `require-dev`, walk the
+checklist below and apply every fitting feature. Not applying one is allowed
+only when the feature is genuinely irrelevant (with a written comment in the
+PR saying why).
+
+**Application checklist**:
+
+| Check | Apply when |
+|---|---|
+| `<method>Examples()` | The property has known edge cases — mutation proofs, manual bugs, boundary values. Each example = one deterministic assertion before the random phase |
+| `Classify::cover()` | The property body branches (`if`/`match`/early return) and every branch must be reached. At least 5% each |
+| `Classify::when()`/`label()` | The input distribution over categories is useful for debugging (even without a gate). Cheap, adds visibility |
+| `#[Property(timeoutMs:`/`budgetMs:`)] | The body involves regex, recursion, network, infinite loops. Protection against catastrophic inputs |
+| `Gen::regex`/`stringMatching` | A static format is under test (id, hostname, header pattern). Builds BOTH valid and invalid strings without `Assume` |
+| `Gen::datetime` | Dates/times under test (cert expiry, timestamp, schedule) |
+| `Gen::bytes` | HMAC, raw binary, hash under test |
+| `Gen::uuid` | An event/resource with a UUID id under test |
+| `Gen::uniqueArrayOf`/`record`/`dictOf` | Collections with unique keys, typed VOs, maps (headers) |
+| `Gen::forClass()` (core ≥0.3) | A property argument is a VO/config with a constructor: the generator is built from the signature (a psalm `@param` beats the native type — `int<0, 100>` yields a range, not the whole `int`), instead of hand-written `Gen::record()` boilerplate. A constructor rejecting a value throws by default; `skipInvalid: true` discards and redraws |
+| `#[Property(edgeCases: EdgeCases::None)]` (core ≥0.3) | The body discards boundary values (`0`, range ends) via `Assume` — the default edge-bias spends roughly one run in five on them and pays the discard budget |
+| `Gen::commands` + `StateMachine::check()` | The SUT has a lifecycle: state machine, retry cycle, delivery pipeline. The 4-file pattern: Model + Command (implements `Rasuvaeff\PropertyTesting\StateMachine\Command`) + Harness + Test. Test **your own** code, not a foreign library under a wrapper |
+| `Assume::that()` | Only when the input is sometimes invalid and cannot be constructed through `flatMap`/`draw` |
+
+**Anti-pattern.** One `#[Property]` + `Gen::int()` + one `Assert::same`
+covers a minimal share of the API. A property with an examples method, a
+`Classify::cover` gate, several generator variants and the stateful pattern
+(where appropriate) yields 3-5x more assertions for the same amount of code —
+and regressions are caught deterministically, not "lucky with the random".
+
+**Reference packages.** `yii3-webhooks/tests/WebhookDeliveryStatefulPropertyTest.php`
+(StateMachine + Classify::cover/when + Examples), `specification/tests/Integration/CompositionLawsPropertyTest.php`
+(Examples + operand catalog), `circuit-breaker/tests/InMemoryStorageTest.php`
+(Classify::cover for half-open probe outcomes). Copy the pattern, do not
+reinvent it.
 
 ### Integration tests
 
@@ -393,13 +511,94 @@ public static function delayStaysWithinCapGenerators(): array
     required status check with no `continue-on-error`, and roave exits with code 3
     on a deliberate major. The step in `templates/.github/workflows/build.yml`
     tolerates a non-zero report exactly when the topmost version heading in
-    `CHANGELOG.md` declares a major above the latest tag. Consequence: the release
-    PR must carry `## X.0.0 — date`, not `## Unreleased` — under `Unreleased` a
-    breaking PR stays red, which is precisely the behaviour you want outside a
-    release.
+    `CHANGELOG.md` declares an intentional compatibility boundary: a major above
+    the latest tag, or — while the package is below 1.0 — a minor above the
+    latest tag (a pre-1.0 break by SemVer; added 2026-08-15 on
+    `property-testing-testo` 0.5.0). Consequence: the release PR must carry
+    `## X.Y.0 — date`, not `## Unreleased` — under `Unreleased` a breaking PR
+    stays red, which is precisely the behaviour you want outside a release.
 - Service containers only when they are needed (ClickHouse, Redis, etc.).
 - Triggers: `pull_request` plus `push` to `master`.
 - `concurrency` must cancel stale runs on the same branch.
+- **Do not gate a matrix job on the `changes` filter.** A matrix job skipped by
+  its own `if` does not expand the matrix: GitHub reports ONE check with the
+  raw name (`PHP ${{ matrix.php }}`) instead of the expanded `PHP 8.3`/`8.4`.
+  When those expanded names are registered as required status checks, the PR
+  sits in "Expected — waiting for a status report" forever. Non-matrix jobs
+  report under their real names when skipped, so gating them is legitimate.
+  In `templates/` the `build` job is already ungated for this reason; the trap
+  was hit twice in the wild.
+- **Mutations get their own narrow filter** (`templates/`, since 2026-08-09):
+  the `changes` job emits two outputs — `run` (a wide list, gating
+  `Prefer lowest` / `Backward compatibility`, 20-50s each) and `mutation`
+  (`src tests composer.json testo.php infection.json5`), gating only
+  `Coverage & Mutation`. A shared filter forced every edit to docs,
+  `examples/`, `psalm.xml`, `rector.php` or `build.yml` itself to pay a full
+  mutation run (~8 minutes on 2105 mutants in the worst package), though none
+  of those files change which mutants exist or which tests kill them. The
+  deliberate trade is recorded in a comment at the filter: editing the
+  mutation STEP of the workflow no longer re-runs the mutations.
+  **The rollout is lazy** — published packages keep the shared filter until
+  their `build.yml` is touched for another reason; once touched, split it.
+- **A package using property tests → wire the regression corpus into the
+  pipeline.** Not in `templates/` (a conditional rule, not for every package) —
+  whenever `build.yml` of a package with `rasuvaeff/property-testing*` in
+  `require-dev` is edited, check/add all three steps below.
+  1. A step before `Test with coverage` in the coverage job — restores the
+     corpus from the GitHub Actions cache (the key is unique per run attempt,
+     `restore-keys` without a suffix pulls the nearest previous one; the SHA
+     is the same pin as `Cache Composer dependencies` in that file):
+     ```yaml
+     - name: Restore property regression corpus
+       uses: actions/cache/restore@<SHA> # vN
+       with:
+         path: build/property-db
+         key: property-db-${{ github.run_id }}-${{ github.run_attempt }}
+         restore-keys: property-db-
+     ```
+  2. `env: PROPERTY_DB: ${{ github.workspace }}/build/property-db` on the
+     `Test with coverage` step itself (`composer test:coverage:ci`).
+  3. The step right after `Test with coverage` — saves the corpus even when
+     coverage failed:
+     ```yaml
+     - name: Save property regression corpus
+       if: ${{ !cancelled() }}
+       uses: actions/cache/save@<SHA> # vN
+       with:
+         path: build/property-db
+         key: property-db-${{ github.run_id }}-${{ github.run_attempt }}
+     ```
+  - **`restore`/`save` are split for a reason.** The combined `actions/cache`
+    declares `post-if: "success()"` — the post-save step never runs on a red
+    job. And it is exactly the failing run that writes to `PROPERTY_DB`: a
+    property falsified → `test:coverage:ci` exits non-zero → the job is red →
+    the counterexample is never saved. That breaks the very scenario the
+    corpus exists for ("a bug got pinned — the regression is caught forever").
+    The upstream escape hatch `save-always: true` is deprecated with exactly
+    the recommendation to split `restore`/`save`. Found in a CodeRabbit review,
+    2026-08-06.
+  - **`run_attempt` in the key is mandatory.** On a re-run the `run_id` is the
+    same, the key is already taken, `save` ends with a `Cache already exists`
+    warning and again saves nothing.
+  - **Without step 1 the corpus does not survive between CI runs.** A
+    GitHub-hosted runner is a fresh VM every time; `build/property-db/` is in
+    `.gitignore` already (all of `/build/`), but without the cache it simply
+    does not exist at the start of the next job — a falsified property
+    replays from the corpus only inside a single job (say, between
+    `composer test` and a repeat infection run), not between pushes/PRs.
+  - Optional: commit the captured corpus into
+    `tests/fixtures/property-regressions/` for local reproduction.
+- **Corpus migration as a rider on any PR into a package without it.** When a
+  PR already touches a published package that has `rasuvaeff/property-testing*`
+  in `require-dev` but no restore/`PROPERTY_DB`/save steps in its
+  `.github/workflows/build.yml` — add them in that same PR (and migrate the
+  frozen `rasuvaeff/property-testing:^2` → `-testo:^0.1` where applicable).
+  Corpus migration is a CI edit; it needs no issue-first. **Do not apply when
+  the change is strictly orthogonal** (only `README.md`/`README.ru.md`/
+  `examples/`/`docs/` with no code) — otherwise the PR mixes unrelated
+  changes. The goal: finish the corpus rollout without a separate wave of
+  issue-first PRs. No-op when the package already has a corpus or has no
+  property tests.
 
 ### static-analysis.yml
 
@@ -410,7 +609,8 @@ public static function delayStaysWithinCapGenerators(): array
 List the minimal set: `json`, `mbstring`, `pdo_sqlite`, and so on.
 If the package needs no special extensions, list `json`.
 
-If the package uses property tests (`rasuvaeff/property-testing`), `mbstring` is
+If the package uses property tests (`rasuvaeff/property-testing-testo` or the
+still-frozen `rasuvaeff/property-testing` in unmigrated packages), `mbstring` is
 mandatory in every job (including `static-analysis.yml`). Without it a local
 `composer build` is green (the `composer:2` image ships mbstring) while CI is red.
 
@@ -616,6 +816,25 @@ For an LLM agent: `bin/dev` output grows in proportion to the number of packages
 in the selector. At `--all`/`@family` scope, run it through a subagent (Agent
 tool / Workflow) that returns a compact pass/fail table per package, rather than
 reading every package's full log yourself.
+
+## Issue-first for user-facing changes
+
+Before fixing a user-facing bug or adding a feature to an already published
+package — file an issue in that package's repository first (`gh issue create`),
+then the branch and a PR referencing `Fixes #N`. Not required for: internal
+changes (build/psalm/cs, refactoring without a contract change, documentation,
+dependencies, CI), packages without a single tag, and work on the honesty of
+mutation/audit coverage (see `docs/evolved-rules.md` ER-003) — that is not a
+new bug from the user's perspective but the closing of a blind spot in our own
+guarantees.
+
+**Why:** issue → PR → merge is visible public tracking of decisions, not a pile
+of commits without history.
+
+**How to apply:** before creating a `fix/...`/`feat/...` branch in an already
+published package — an issue in that same repository as the first step, right
+away with a label and an assignee: `gh issue create --label bug --assignee @me
+...` (for a feature — `--label enhancement`).
 
 ## New package creation process
 
@@ -912,9 +1131,11 @@ is to release a new patch version. Therefore:
 
 ## Existing packages
 
-The monorepo holds 55 published packages under the `rasuvaeff/*` vendor. Each
+The monorepo holds 66 published packages under the `rasuvaeff/*` vendor. Each
 lives in its own directory whose name matches the package name, with the
-namespace `Rasuvaeff\<PascalCase>` (kebab → PascalCase, see "Naming").
+namespace `Rasuvaeff\<PascalCase>` (kebab → PascalCase, see "Naming"). A
+directory with a `composer.json` but no remote (an intentionally unpublished
+archive) is not part of the count.
 
 The current list is at https://github.com/rasuvaeff?tab=repositories and
 https://packagist.org/packages/rasuvaeff/
