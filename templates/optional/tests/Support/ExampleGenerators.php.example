@@ -1,0 +1,61 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Rasuvaeff\{{PACKAGE_PASCAL}}\Tests\Support;
+
+use Rasuvaeff\PropertyTesting\ArbitraryInterface;
+use Rasuvaeff\PropertyTesting\Gen;
+
+/**
+ * Where a property-test generator belongs once it is more than one call.
+ *
+ * Not inside the test class: a helper only reflection calls has nowhere to hide
+ * there. `private static` is what Rector's dead-code set deletes, and the
+ * moment a `#[Property]` body calls it,
+ * `LocallyCalledStaticMethodToNonStaticRector` rewrites it into an instance
+ * method — which the `public static` `<testMethod>Generators()` provider can no
+ * longer reach. Neither failure shows up on `composer build` (it never runs
+ * rector); both show up on `composer release-check`, at release time.
+ *
+ * As a provider class referenced from the attribute it is neither, and another
+ * test class can reuse it:
+ *
+ * ```php
+ * #[Property(runs: 300, generators: [ExampleGenerators::class, 'verdictFlag'])]
+ * public function rejectedInputsStayRejected(bool $private): void { ... }
+ * ```
+ *
+ * The callable form also accepts `'ExampleGenerators::verdictFlag'` and an
+ * invokable object. A bare string resolves against the test class first, so a
+ * local method of the same name wins.
+ */
+final readonly class ExampleGenerators
+{
+    /**
+     * A generator map: keys are the property's parameter names.
+     *
+     * @return array<string, ArbitraryInterface>
+     */
+    public static function verdictFlag(): array
+    {
+        return ['private' => Gen::bool()];
+    }
+
+    /**
+     * A single generator, for a provider that composes several of these.
+     *
+     * Construct dependent values, do not filter them: `Assume::that()` discards
+     * runs, and a generator that discards a third of them spends the budget on
+     * nothing.
+     */
+    public static function boundedPair(): ArbitraryInterface
+    {
+        return Gen::intBetween(0, 1_000)->flatMap(
+            static fn (int $low): ArbitraryInterface => Gen::tuple(
+                Gen::elements([$low]),
+                Gen::intBetween($low, $low + 1_000),
+            ),
+        );
+    }
+}

@@ -17,10 +17,10 @@ This is a **showcase, not a product.**
 - Nothing here is on Packagist. There is no versioning, no backwards-compatibility
   promise, and no support commitment.
 - It is published because the interesting part is not the code — it is the
-  answer to "how does one person keep 66 packages consistent, statically clean,
+  answer to "how does one person keep 90 packages consistent, statically clean,
   mutation-tested and release-safe?" That answer is a process, and this is the
   process, verbatim.
-- **It is a snapshot, taken 2026-08-16, not a mirror.** The working copy lives in
+- **It is a snapshot, last refreshed 2026-10-28, not a mirror.** The working copy lives in
   a private monorepo and keeps moving; this repository is not expected to track
   it. Read it as a record of how the packages were built, not as the current
   state of anyone's build system. The packages themselves are the living
@@ -33,14 +33,21 @@ Copy anything you find useful. Expect to adapt it.
 | Path | What it is |
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | The rulebook. File set, code style, test conventions, CI requirements, security rules, naming, and the four end-to-end processes (create / build / review / publish a package) |
-| [`docs/evolved-rules.md`](docs/evolved-rules.md) | `ER-001` … `ER-047` — a numbered catalogue of concrete engineering gotchas found in production work: CI traps, static-analysis conflicts, mutation-testing quirks, DI wiring pitfalls, release-process incidents. Each entry records what broke, why, and the rule that came out of it |
+| [`docs/evolved-rules.md`](docs/evolved-rules.md) | `ER-001` … `ER-050` — a numbered catalogue of concrete engineering gotchas found in production work: CI traps, static-analysis conflicts, mutation-testing quirks, DI wiring pitfalls, release-process incidents. Each entry records what broke, why, and the rule that came out of it |
 | [`DEV-TOOL.md`](DEV-TOOL.md) | How to drive `bin/dev` |
 | [`templates/`](templates/) | The skeleton a new package is cut from: `composer.json`, psalm/rector/infection/php-cs-fixer configs, `Makefile`, hardened GitHub Actions workflows, branch-protection payload, doc stubs |
+| [`templates/optional/`](templates/optional/) | What a package takes only when it needs it: the shipped agent-skill stub, a property-test generator provider, the `*-db` cross-database migration test and its ungated `database-integration` job, and the documentation-site CI (Pages build, external-link checker, Vale config) |
+| [`docs/mutation-blind-spots.md`](docs/mutation-blind-spots.md) | The report behind `ER-003`, regenerated from the live workspace: every `src/` type named in no `#[Covers]`, and therefore carrying zero mutants, split into "real logic" and "nothing to mutate anyway" |
+| [`docs/package-families.md`](docs/package-families.md) | The map: which packages are cores, which are backends, which primitives everything else depends on, and the `bin/dev` selector for each family |
 | [`bin/dev`](bin/dev) + [`bin/dev-lib/`](bin/dev-lib/) | Batch operations across packages — parallel `exec`/`build`/`test`/`psalm`, batch git with `--dry-run`, batch CHANGELOG entries, template replication |
 | [`bin/package-audit`](bin/package-audit) | Deterministic per-package audit: required files, `@api`/`@internal` on every type, `#[Covers]` on every test class, no psalm suppressions, docs mention every public type, examples actually run |
 | [`bin/build-digest`](bin/build-digest) | Runs a composer script in Docker and prints one `PASS`/`FAIL` line instead of several hundred — the difference between a usable and an unusable agent session |
 | [`bin/config-merge-harness`](bin/config-merge-harness) | Merges a family of `config-plugin` packages the way a real Yii3 application does, and fails on a `yiisoft/config` duplicate key — the cross-package error no package-level test can see |
 | [`bin/verify-clean-clone`](bin/verify-clean-clone) | Clones a published package into a temp dir and builds it there, so "works on my machine" is never the claim |
+| [`bin/dist-smoke`](bin/dist-smoke) | Installs a package the way a consumer does — from `git archive HEAD`, through a path repository onto the extraction — and checks that the archive holds no dev directory or tooling config and that its public types load. The one tree no other gate reads (`ER-050`) |
+| [`bin/covers_audit.py`](bin/covers_audit.py) + [`bin/covers_report.py`](bin/covers_report.py) | Finds the `src/` types that no `#[Covers]` names, which is the set Infection generates no mutants for, and triages them into real logic and trivia |
+| [`bin/hooks-self-test`](bin/hooks-self-test) | Feeds synthetic `PreToolUse` payloads to the hooks in `.claude/hooks/` — green before any change to them |
+| [`bin/backfill-releases`](bin/backfill-releases) | Creates a GitHub Release for every tag predating `release.yml`, idempotently and without ever touching an existing one |
 | [`bin/dev-self-test`](bin/dev-self-test) | A self-test suite for the batch tooling itself, run against a fixture workspace in `/tmp` |
 | [`.claude/`](.claude/) | The agent layer: six skills (create / build / review / publish / raise mutation score / contribute upstream), a package-builder subagent, and two `PreToolUse` hooks — a bash-command guard and a pre-commit audit |
 | [`replicate/manifest.bash`](replicate/manifest.bash) | The short list of files that are meant to be byte-identical across packages. It is short on purpose — most template files diverge deliberately |
@@ -63,7 +70,7 @@ Outside the build gate, because they need a coverage driver or a previous tag:
 |---|---|---|
 | Mutation testing | `infection/infection` via `testo/bridge-infection` | `minMsi` starts at 85 and is raised as a package matures |
 | Backwards compatibility | `roave/backward-compatibility-check` | required status check; a release declaring an intentional compatibility boundary (a major, or a minor while below 1.0) in the CHANGELOG is the only one that may carry breaks |
-| Automated refactoring | `rector/rector` | dry-run in `release-check` |
+| Automated refactoring | `rector/rector` | dry run in CI (`static-analysis.yml`) and in `release-check` — it used to run nowhere but a human's terminal, and was red under green builds for five releases of one family |
 
 CI is hardened rather than convenient: every `uses:` is pinned to a 40-character
 commit SHA with a `# vN` trailing comment, workflows declare
@@ -75,6 +82,14 @@ Dependabot, which bumps SHA pins in place.
 Published packages run with protected `master`: pull request required, status
 checks required, no direct pushes. The exact payload is
 [`templates/branch-protection.json`](templates/branch-protection.json).
+
+A tag is not trusted either. Before publishing a GitHub Release,
+`templates/.github/workflows/release.yml` checks that the tagged commit is an
+ancestor of `master` and that its `PHP *` matrix check-runs concluded
+`success`, waiting up to 15 minutes for a build still in flight — a pending
+check-run is not a verdict. Packagist publishes off the tag itself, so this
+cannot unpublish anything; what it enforces is the one invariant the release
+process rests on, that a tag sits on a merged commit whose CI passed.
 
 ## How it is actually used
 
@@ -90,6 +105,13 @@ bin/build-digest yii3-outbox build
 
 # conventions check that does not need a human
 bin/package-audit yii3-outbox
+
+# what a consumer actually downloads
+bin/dist-smoke yii3-outbox
+
+# which types the mutation gate says nothing about
+bin/covers_audit.py build/covers-audit.json
+bin/covers_report.py build/covers-audit.json docs/mutation-blind-spots.md
 
 # coordinated change across a family
 bin/dev git:checkout -b feat/thing @outbox
@@ -123,6 +145,12 @@ wrong. A sample of what is in there:
   every future pull request (`ER-046`).
 - `yiisoft/db-migration` matches PSR-4 namespaces by string prefix, lands in the
   wrong package, and returns "0 migrations" without an error (`ER-044`).
+- A literal `DEFAULT` on a `TEXT` column makes `migrate:up` create no table at
+  all on MySQL — while SQLite, the only driver in `require-dev`, accepts the
+  same DDL and keeps CI green (`ER-049`).
+- No gate reads the tree a consumer downloads: `composer build`, psalm, testo,
+  infection and the audit all read the working tree, and a forgotten
+  `export-ignore` line is visible only from the archive (`ER-050`).
 - A fatal inside a test dies with a soundless `exit 255` — the runner's output
   buffer swallows the error, and "the runner cannot do X" is the wrong
   conclusion to write into the commit message (`ER-047`).

@@ -43,6 +43,8 @@ There is no PHP/Composer on the host — everything runs through Docker
 | `build/` | `.gitkeep` | For coverage reports |
 | `src/Migration/` | `*-db` only | `yiisoft/db-migration` migrations live under the package namespace, not in `migrations/`. See "Packages with migrations" |
 | `UPGRADE.md` | Majors with manual steps | What the user must do by hand (SQL, config replacement) before upgrading |
+| `resources/skills/rasuvaeff-<kebab>/SKILL.md` | `templates/optional/SKILL.md` | The agent skill the package ships to its consumers, wired through `extra.skills.source`. See "extra: the shipped agent skill" |
+| `tests/Integration/CrossDatabaseMigrationTest.php` | `templates/optional/tests/Integration/` (`*-db` only) | Applies the real migration to live MySQL/PostgreSQL. See "Packages with migrations" |
 
 ## Template placeholders
 
@@ -95,6 +97,26 @@ There is no PHP/Composer on the host — everything runs through Docker
 }
 ```
 
+### extra: the shipped agent skill
+
+```json
+{
+    "extra": {
+        "skills": {
+            "source": "resources/skills"
+        }
+    }
+}
+```
+
+A package ships one skill of its own, at
+`resources/skills/rasuvaeff-<kebab>/SKILL.md`, and `extra.skills.source` is
+where a consumer's tooling finds it. The file carries YAML front matter with
+`name` (`rasuvaeff-<kebab>`) and a `description` that names the public types and
+says when the skill applies, then the package's safety rules — the same content
+an agent would otherwise have to infer from the README. `.gitattributes` must
+NOT export-ignore `resources/`: the skill is part of what the consumer installs.
+
 ### Standard dev dependencies
 
 ```json
@@ -102,7 +124,7 @@ There is no PHP/Composer on the host — everything runs through Docker
     "require-dev": {
         "ergebnis/composer-normalize": "^2.51",
         "friendsofphp/php-cs-fixer": "^3.95",
-        "infection/infection": "^0.33",
+        "infection/infection": "^0.35",
         "maglnet/composer-require-checker": "^4.17",
         "rasuvaeff/rector-named-literals": "^1.0",
         "rector/rector": "^2.4",
@@ -114,13 +136,20 @@ There is no PHP/Composer on the host — everything runs through Docker
 }
 ```
 
+The `infection/infection` constraint is **one major, not a union**.
+`composer build` does not run mutations, so the `Prefer lowest` job pins the
+lower bound and never exercises it: `^0.33 || ^0.34 || ^0.35` promises to work
+on versions no run ever checks. Published packages carry both forms (Dependabot
+widens into a union, a manual PR replaces it) — converge them lazily, while
+touching `composer.json` for another reason.
+
 Add extra dev dependencies only when integration tests need them (for example
 `yiisoft/db-sqlite` for SQLite tests, `guzzlehttp/guzzle` for HTTP).
 
 If the package contains code with algebraic laws or invariants (see
-"Property-based tests"), add `"rasuvaeff/property-testing-testo": "^0.1"` to
+"Property-based tests"), add `"rasuvaeff/property-testing-testo": "^1.0"` to
 `require-dev` and `mbstring` to `extensions:` in every CI job. Install it with
-`-W` (`composer require --dev "rasuvaeff/property-testing-testo:^0.1" -W`) — see
+`-W` (`composer require --dev "rasuvaeff/property-testing-testo:^1.0" -W`) — see
 the dev-dependency row in "Property-based tests": without `-W` composer cannot
 resolve the `testo/testo` bump the adapter pulls in.
 
@@ -231,6 +260,18 @@ creating any tables. Require `^2.1` in `require` and document the recipe
 `Injector::make()` and never touch that path at all. The reference
 implementation — `yii3-filestorage-db/tests/Integration/SqliteIntegrationTest.php`.
 Incident details — `docs/evolved-rules.md` ER-044.
+
+⛔ **No literal `DEFAULT` on a `TEXT`/`BLOB`/`JSON` column.** MySQL and MariaDB
+reject it with error 1101, and `migrate:up` returns having created no table at
+all — on SQLite (the only driver in `require-dev`) and on PostgreSQL the same
+DDL passes, so CI is green. Declare a column the package itself writes as
+`text NOT NULL`; a column only the consumer writes as `text NULL`. A package
+with a migration must carry a `CrossDatabaseMigrationTest` and an ungated
+matrix `database-integration` job (MySQL + PostgreSQL service containers). The
+details, the shape of the fix (edit the migration in place — the migration
+history stores only the name, so an installation that already applied the file
+never reads its body again) and the local recipe —
+`docs/evolved-rules.md` ER-049.
 
 ## Code style
 
@@ -434,9 +475,9 @@ public static function delayStaysWithinCapGenerators(): array
 | `#[Property(timeoutMs: N)]` | A wall-clock deadline for one run. Mandatory for regex/recursion tests — `DeadlineExceededException` catches catastrophic inputs before they hang CI. `budgetMs` is the budget of the whole random phase |
 | Construct, do not filter | Build dependent values (`$max = $n + $slack`) instead of discarding them through `Assume::that(...)` — otherwise a third of the runs is thrown away |
 | `Assume::that(bool)` | Only when construction is impossible (it warns above 90% discards) |
-| Helper generator | A `private static function xGenerator(): ArbitraryInterface` is fine — under `#[Test]` it does not become a test (it returns neither `void` nor `never`) |
+| Helper generator | **Move it into a provider class `tests/Support/<Name>Generators.php`** (public static methods) and wire it with the callable form `#[Property(generators: [HostGenerators::class, 'verdictFlag'])]`. A `private static function xGenerator(): ArbitraryInterface` inside the test class does not become a test (it returns neither `void` nor `never`), but it **turns rector red**: `LocallyCalledStaticMethodToNonStaticRector` rewrites such a helper into an instance method as soon as a `#[Property]` body calls it — and then the `public static` `<testMethod>Generators()` provider can no longer reach it. It does not surface on `composer build` (which never runs rector) but on `composer release-check` — that is, at release time. Do **not** add a `withSkip` for this rule: not one package in the workspace skips it. Reference — `yii3-webhooks/tests/Support/HostGenerators.php` (2026-08-22) |
 | CI: `ext-mbstring` | property-testing requires `mbstring` (plus `random`, core). Add `mbstring` to `extensions:` in every job of `build.yml`/`static-analysis.yml`, otherwise a local `composer build` is green while CI is red |
-| dev dependency | `"rasuvaeff/property-testing-testo": "^0.1"` in `require-dev`. `composer require --dev "rasuvaeff/property-testing-testo:^0.1" -W` — without `-W` composer fails with "Your requirements could not be resolved" when a lock file holds `testo/testo` below the version the adapter requires (`^0.10.39 \|\| ^1.0`); `-W` allows bumping `testo/testo` and its satellites by minors. Verified live on `duration`/`retry`/`yii3-ab-testing` 2026-08-09 — `composer build` green without a single PHP-code edit |
+| dev dependency | `"rasuvaeff/property-testing-testo": "^1.0"` in `require-dev`. `composer require --dev "rasuvaeff/property-testing-testo:^1.0" -W` — without `-W` composer fails with "Your requirements could not be resolved" when a lock file holds `testo/testo` below the version the adapter requires (`^0.10.39 \|\| ^1.0`); `-W` allows bumping `testo/testo` and its satellites by minors. Verified live on `duration`/`retry`/`yii3-ab-testing` 2026-08-09 — `composer build` green without a single PHP-code edit |
 
 ### Making the most of the property-testing API
 
@@ -453,6 +494,19 @@ checklist below and apply every fitting feature. Not applying one is allowed
 only when the feature is genuinely irrelevant (with a written comment in the
 PR saying why).
 
+**The modern forms are the default, not an option.** The family has moved on
+while agents write the API they remember from two years ago: hand-rolled
+`Gen::record()` boilerplate where `Gen::forClass()` is enough; a provider method
+where the parameters are fully described by types and `#[Property(auto: true)]`
+does it; a `private static` helper inside the test class where the set belongs in
+a provider under `tests/Support/`. Before writing a provider method by hand, run
+three questions: parameters expressible as types → `auto: true`; the argument is
+a VO/config with a constructor → `Gen::forClass()`; the set is reused across test
+classes or called from a property body → a provider class plus
+`[Provider::class, 'method']`. A hand-written provider stays for what a type
+cannot express — dependent pairs through `flatMap`, narrow float ranges, domain
+alphabets.
+
 **Application checklist**:
 
 | Check | Apply when |
@@ -466,8 +520,9 @@ PR saying why).
 | `Gen::bytes` | HMAC, raw binary, hash under test |
 | `Gen::uuid` | An event/resource with a UUID id under test |
 | `Gen::uniqueArrayOf`/`record`/`dictOf` | Collections with unique keys, typed VOs, maps (headers) |
-| `Gen::forClass()` (core ≥0.3) | A property argument is a VO/config with a constructor: the generator is built from the signature (a psalm `@param` beats the native type — `int<0, 100>` yields a range, not the whole `int`), instead of hand-written `Gen::record()` boilerplate. A constructor rejecting a value throws by default; `skipInvalid: true` discards and redraws |
-| `#[Property(edgeCases: EdgeCases::None)]` (core ≥0.3) | The body discards boundary values (`0`, range ends) via `Assume` — the default edge-bias spends roughly one run in five on them and pays the discard budget |
+| `Gen::forClass()` | A property argument is a VO/config with a constructor: the generator is built from the signature (a psalm `@param` beats the native type — `int<0, 100>` yields a range, not the whole `int`), instead of hand-written `Gen::record()` boilerplate. A constructor rejecting a value throws by default; `skipInvalid: true` discards and redraws |
+| `#[Property(auto: true)]` (`-phpunit`: the fluent `auto()`) | The property parameters are fully described by psalm `@param`/native types — no provider method is needed at all (generators are derived from the signature through `Gen::forParameters`). A provider under `auto` holds **partial overrides**: list only what a type cannot express (a float range, a dependent pair through `flatMap`), the rest is derived. A provider key that is not a parameter is an error. Strictly opt-in: a bare `int`/`float` yields the full native domain — annotate the narrow ones |
+| `#[Property(edgeCases: EdgeCases::None)]` | The body discards boundary values (`0`, range ends) via `Assume` — the default edge-bias spends roughly one run in five on them and pays the discard budget |
 | `Gen::commands` + `StateMachine::check()` | The SUT has a lifecycle: state machine, retry cycle, delivery pipeline. The 4-file pattern: Model + Command (implements `Rasuvaeff\PropertyTesting\StateMachine\Command`) + Harness + Test. Test **your own** code, not a foreign library under a wrapper |
 | `Assume::that()` | Only when the input is sometimes invalid and cannot be constructed through `flatMap`/`draw` |
 
@@ -599,10 +654,68 @@ reinvent it.
   changes. The goal: finish the corpus rollout without a separate wave of
   issue-first PRs. No-op when the package already has a corpus or has no
   property tests.
+- **Moving to property-testing 1.0 — the same rider, the same laziness.** When a
+  PR already touches a package whose `require-dev` holds
+  `rasuvaeff/property-testing-testo` / `-phpunit` / `-names` below `^1.0` (or
+  `-openapi` below `^0.17`), then in that same PR: (1) raise the constraint to
+  `^1.0` (`-openapi` → `^0.17`; and `infection/infection` to `^0.35` while you
+  are there, if it is still a union or an older major); (2) `composer update -W`
+  (without `-W` composer will not raise `testo/testo`); (3) `composer build`.
+  Green with no edits is the normal outcome: six intermediate 0.x minors touched
+  no test in `yii3-webhooks`. What the strict 1.0 engine rejects where 0.4–0.6
+  swallowed it silently — each one is a bug in the test, fixed there and not in
+  the constraint:
+  - `Gen::oneOf(Gen::…, Gen::…)` / `Gen::elements([Gen::…])` take **values**, so
+    generators became literal data; now `OneOf takes values, not generators` →
+    use `Gen::frequency([[1, $a], [1, $b]])`;
+  - `#[ExpectException]` next to `#[Property]` is rejected →
+    `#[Property(throws: X::class)]`;
+  - a provider key that is not a property parameter is rejected even without
+    `auto: true` (it used to be ignored silently);
+  - a `private static` helper generator inside the test class turns rector red
+    on `release-check` (see the "Helper generator" row above).
+  A dependency edit; it needs no issue-first. **Do not apply when the change is
+  strictly orthogonal** (docs or `examples/` only).
+
+### release.yml
+
+Publishes a GitHub Release on a `v*` tag push, extracting the section from
+`CHANGELOG.md`.
+
+- **The tag must point at validated master history.** Since 2026-08-22 the
+  template makes sure, before creating the Release, that the tagged SHA is an
+  ancestor of `master` and that its `PHP *` matrix check-runs concluded
+  `success`. Without that the workflow published a Release for any tag at all,
+  including one placed on a commit whose CI was never green: `build.yml` fires
+  on `pull_request` and on a push to `master`, and on a tag — nothing.
+- **A pending check-run is not a verdict.** The tag is pushed seconds after the
+  merge, while master's own build is still queued. A `conclusion` of `null`
+  means "not settled yet" and an empty list means "not dispatched yet"; judging
+  either as a failure failed every promptly tagged release. The step waits for
+  both, up to 15 minutes, and a re-run of the workflow is enough afterwards —
+  the tag does not need to move.
+- **The full `release-check` deliberately does not run here.** Packagist
+  publishes off the tag itself through its own webhook: by the time this job
+  runs the package is already installable, and refusing to create a Release
+  cancels nothing. Running the whole set would look like a gate without being
+  one, and would cost minutes on every release. What is checked is exactly what
+  the process in "Publish a package" rests on: the tag sits on a merged commit
+  with a green CI.
+- **Lazy rollout.** `release.yml` is NOT in `replicate/manifest.bash`, so
+  packages published before the check carry the version without it. There is no
+  separate wave: an agent adds the step to a package when a PR for another
+  reason already touches that package — exactly like the corpus migration
+  above. A CI edit; it needs no issue-first. **Do not apply when the change is
+  strictly orthogonal** (docs or `examples/` only).
+
 
 ### static-analysis.yml
 
-- PHP `8.4`, `coverage: none`, `composer psalm` only.
+- PHP `8.4`, `coverage: none`.
+- Two steps: `composer psalm` and `composer rector` (dry run). Rector is part of
+  `composer release-check` and used to be run by nobody but a human before a
+  tag: it was red under green builds for five releases of one family before
+  anyone looked. It lives in the same job so the required check keeps its name.
 
 ### PHP extensions
 
@@ -676,6 +789,18 @@ one version is incomplete.
 ```
 
 SemVer: breaking → major, feature → minor, fix → patch.
+
+**Exactly one `## Unreleased`, and above every released version.** A new entry
+is a bullet under the heading that already exists, not a heading of its own. A
+release renames the **first** `## Unreleased` it finds; a second one is passed
+over silently, and content that actually shipped in the tag stays marked
+unreleased forever — while the release notes rendered from that tag's section
+never mention it. That is how `openapi-contract` v0.7.0 lost its header
+decision and `yii3-mcp` v2.2.0 lost three server parameters: in both cases the
+stranded heading was already inside the tag's tree, so the extractor cut the
+section short at it. Both bodies were re-rendered with `gh release edit`
+(2026-09-05). `bin/package-audit` fails on both shapes (more than one
+`## Unreleased`; an `## Unreleased` below a released version).
 
 ### llms.txt
 
@@ -808,6 +933,8 @@ make release-check
 | `bin/dev build` / `test` / `cs-fix` / `psalm` `[pkgs]` | Sugar for `exec "make <target>"` |
 | `bin/dev git:status` / `branch` / `checkout` / `commit` / `push` / `pull` `[pkgs]` | Batch git; the mutating ones support `--dry-run` |
 | `bin/dev replicate:check` / `files` / `copy-file` | Syncs `templates/` → packages per `replicate/manifest.bash` |
+| `bin/dist-smoke <pkg>` | Installs the package the way a consumer does — from `git archive HEAD` through a path repository onto the extraction — and checks that the archive holds no dev directory and no tooling config, and that its public types load from it. The only check that reads the distribution (ER-050). New on 2026-10-28 and run on four packages so far — recommended before a release, not yet a gate |
+| `bin/covers_audit.py` + `bin/covers_report.py` | The `src/` types no `#[Covers]` names, which is the set Infection generates no mutants for at all (ER-003). Report: `docs/mutation-blind-spots.md`, library packages only |
 | `bin/dev changelog:add "<entry>" [--type=...] [pkgs]` | Writes into the `## Unreleased` section of several `CHANGELOG.md` files |
 
 `bin/dev-self-test` must be green before committing any change to `bin/dev`.
@@ -992,7 +1119,8 @@ Or through the Makefile: `make build`, `make cs-fix`, `make psalm`, `make test`.
    `@psalm-suppress`/psalm baselines, `@api`/`@internal` on every type in `src/`,
    `#[Covers]`/`#[CoversNothing]` on test classes, that `@api` types are mentioned
    in `README.md`/`llms.txt`, lint plus execution of the server-independent
-   `examples/*.php`, and the absence of stale `make x:y` references in the docs.
+   `examples/*.php`, the absence of stale `make x:y` references in the docs, and
+   exactly one `## Unreleased` in `CHANGELOG.md`, above every released version.
    `FAIL` is an error (non-zero exit), `WARN` is informational. After that, the
    manual steps below cover only what the script does not.
 1. **Read the rules**: the root `AGENTS.md` plus the package `AGENTS.md`.
@@ -1131,7 +1259,8 @@ is to release a new patch version. Therefore:
 
 ## Existing packages
 
-The monorepo holds 66 published packages under the `rasuvaeff/*` vendor. Each
+The monorepo holds 90 published packages under the `rasuvaeff/*` vendor
+(count taken from Packagist on 2026-10-28). Each
 lives in its own directory whose name matches the package name, with the
 namespace `Rasuvaeff\<PascalCase>` (kebab → PascalCase, see "Naming"). A
 directory with a `composer.json` but no remote (an intentionally unpublished

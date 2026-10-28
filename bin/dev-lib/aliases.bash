@@ -18,6 +18,7 @@ declare -A DEV_ALIASES=(
   [@workflow]='yii3-workflow*'
   [@utm]='yii3-utm*'
   [@property-testing]='property-testing*'
+  [@understudy]='understudy*'
 
 )
 

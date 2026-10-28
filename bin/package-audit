@@ -19,7 +19,11 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The workspace root: the directory whose direct children are the package
+# repositories. Defaults to the parent of bin/, overridable for a workspace
+# laid out elsewhere (the same convention as bin/dist-smoke and
+# bin/add-benchmarks-infra).
+REPO_ROOT="${MONOREPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # Files required by the "Required file set" table in the root AGENTS.md.
 REQUIRED_FILES=(
@@ -151,7 +155,10 @@ audit_one() {
 
   # 2. no @psalm-suppress / no baseline ---------------------------------------
   local sup_files baseline_hits=0 sup_count=0
-  sup_files="$(grep -rIlE '@psalm-suppress' "$pkg/src" "$pkg/tests" 2>/dev/null || true)"
+  # A fixture project under tests/ may carry a vendor tree of its own (the
+  # Pest recipe in understudy-phpunit does); third-party suppressions in it
+  # are not this package's business.
+  sup_files="$(grep -rIlE '@psalm-suppress' "$pkg/src" "$pkg/tests" 2>/dev/null | grep -v '/vendor/' || true)"
   [ -n "$sup_files" ] && sup_count="$(printf '%s\n' "$sup_files" | grep -c . )"
   if [ -f "$pkg/psalm.xml" ] && grep -qiE 'errorBaseline|<baseline' "$pkg/psalm.xml"; then
     baseline_hits=1
@@ -169,9 +176,12 @@ audit_one() {
   while IFS= read -r srcfile; do
     [ -n "$srcfile" ] || continue
     grep -qE '^[[:space:]]*(abstract +|final +|readonly +)*(class|interface|trait|enum)[[:space:]]+[A-Za-z_]' "$srcfile" || continue
-    if grep -qE '@api' "$srcfile"; then
+    # The tag as a docblock line of its own (` * @api`), not the word inside a
+    # sentence: `Outcome` says "It was `@api` by 0.8" while being `@internal`,
+    # and the prose match reported it as undocumented public API.
+    if grep -qE '^[[:space:]]*\*[[:space:]]*@api([[:space:]]|$)' "$srcfile"; then
       api_types+=("$srcfile")
-    elif ! grep -qE '@internal' "$srcfile"; then
+    elif ! grep -qE '^[[:space:]]*\*[[:space:]]*@internal([[:space:]]|$)' "$srcfile"; then
       bad_api+=("${srcfile#$pkg/}")
       err "src type without @api/@internal: ${srcfile#$pkg/}"
     fi
@@ -180,12 +190,15 @@ audit_one() {
   check_line "src @api" "$e" 0 "$([ "$e" -gt 0 ] && echo "${bad_api[*]}")"
 
   # 4. every test class has #[CoversClass] or #[CoversNothing] -----------------
+  # Fixture projects under tests/**/Fixture(s)/ are excluded: they are driven
+  # by another runner (a real PHPUnit subprocess, say), not by testo's
+  # collector, so #[Covers] on them would be noise, not attribution.
   local tf bad_covers=()
   while IFS= read -r tf; do
     [ -n "$tf" ] || continue
     grep -qE '^[[:space:]]*(abstract +|final +)*class[[:space:]]+[A-Za-z_]' "$tf" || continue
     grep -qE '#\[(Covers|CoversNothing)' "$tf" || { bad_covers+=("${tf#$pkg/}"); err "test without Covers/CoversNothing: ${tf#$pkg/}"; }
-  done < <(find "$pkg/tests" -name '*Test.php' 2>/dev/null | sort)
+  done < <(find "$pkg/tests" -name '*Test.php' -not -path '*/Fixture/*' -not -path '*/Fixtures/*' 2>/dev/null | sort)
   e=${#bad_covers[@]}
   check_line "test covers" "$e" 0 "$([ "$e" -gt 0 ] && echo "${bad_covers[*]}")"
 
@@ -220,6 +233,30 @@ audit_one() {
   else
     check_line "stale cmds" 0 0
   fi
+
+  # 8. `## Unreleased` — at most one, and above every released version --------
+  # A release renames the first `## Unreleased` heading it finds. A second one
+  # below a version heading is content that shipped and stayed marked
+  # unreleased, so the notes rendered for that version never mention it —
+  # openapi-contract v0.7.0 lost its header decision exactly that way.
+  local n_unrel=0 n_stray=0
+  if [ -f "$pkg/CHANGELOG.md" ]; then
+    read -r n_unrel n_stray < <(awk '
+      /^## / {
+        if (tolower($0) ~ /^## unreleased/) { u++; if (released) s++ }
+        else released = 1
+      }
+      END { print u + 0, s + 0 }
+    ' "$pkg/CHANGELOG.md")
+  fi
+  e=0
+  if [ "$n_unrel" -gt 1 ]; then
+    e=$((e + 1)); err "CHANGELOG.md carries $n_unrel '## Unreleased' headings; a release renames only the first"
+  fi
+  if [ "$n_stray" -gt 0 ]; then
+    e=$((e + 1)); err "CHANGELOG.md carries '## Unreleased' below a released version: that content shipped and its notes never said so"
+  fi
+  check_line "changelog" "$e" 0 "$([ "$e" -gt 0 ] && echo "unreleased headings: $n_unrel, below a version: $n_stray")"
 
   # summary --------------------------------------------------------------------
   local ne=${#ERRORS[@]} nw=${#WARNS[@]}
@@ -343,7 +380,17 @@ main() {
   if [ "$#" -eq 0 ] || [ "${1:-}" = "--all" ]; then
     while IFS= read -r p; do targets+=("$p"); done < <(discover_packages)
   else
-    targets=("$@")
+    # A bare package name resolves against the workspace root, so the script
+    # works from anywhere (and from a checkout that is not the workspace root,
+    # with MONOREPO_ROOT set).
+    local arg
+    for arg in "$@"; do
+      if [ ! -d "$arg" ] && [ -d "$REPO_ROOT/$arg" ]; then
+        targets+=("$REPO_ROOT/$arg")
+      else
+        targets+=("$arg")
+      fi
+    done
   fi
 
   local rc=0 pass=0 fail=0

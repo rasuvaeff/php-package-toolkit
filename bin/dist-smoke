@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#
+# dist-smoke — install one package the way a consumer does, from its dist
+# archive, and check what the archive actually contains.
+#
+# Every other gate in this workspace reads the WORKING TREE: `composer build`,
+# psalm, testo, infection, `bin/package-audit`. What a consumer downloads is
+# `git archive <tag>` with `export-ignore` from `.gitattributes` applied, and
+# between those two trees there is no check at all — a forgotten `export-ignore`
+# line turns nothing red (see docs/evolved-rules.md ER-050). `bin/verify-clean-clone`
+# does not close this either: it clones the whole repository, `tests/` included.
+#
+# The archive, not a path repository onto the package directory: a path
+# repository copies the working tree, so the blind spot would survive the test
+# meant to find it. The package is extracted first, and the path repository
+# points at the extraction.
+#
+# Checks, in order:
+#   1. the package resolved from this checkout and not from Packagist
+#      (`vendor/composer/installed.json` → `dist.type == "path"`; without this
+#      the run can silently pass while testing the published release);
+#   2. the archive carries no development directory and no tooling config;
+#   3. `vendor/autoload.php` can load the package's own public classes, so a
+#      PSR-4 prefix pointing at a path `export-ignore` removed is caught.
+#
+# Usage: bin/dist-smoke <package> [--keep]
+#
+# Exit codes: 0 the distribution is sound, 1 it is not, 2 environment error.
+
+set -Eeuo pipefail
+
+ROOT="${MONOREPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
+IMAGE="${COMPOSER_IMAGE:-composer:2}"
+KEEP=0
+PKG=''
+
+for arg in "$@"; do
+    case "$arg" in
+        --keep) KEEP=1 ;;
+        -*) printf 'unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+        *)  [ -n "$PKG" ] && { printf 'one package at a time\n' >&2; exit 2; }
+            PKG="$arg" ;;
+    esac
+done
+
+[ -n "$PKG" ] || { printf 'usage: bin/dist-smoke <package> [--keep]\n' >&2; exit 2; }
+
+SRC="$ROOT/$PKG"
+[ -f "$SRC/composer.json" ] || { printf 'no composer.json in %s\n' "$SRC" >&2; exit 2; }
+git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1 \
+    || { printf 'not a git checkout, so there is no archive to test: %s\n' "$SRC" >&2; exit 2; }
+command -v docker >/dev/null || { printf 'docker is required (no PHP on the host)\n' >&2; exit 2; }
+
+NAME="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$SRC/composer.json")"
+WORK="$(mktemp -d)"
+
+cleanup() {
+    if [ "$KEEP" -eq 1 ]; then
+        printf '\nkept: %s\n' "$WORK"
+        return
+    fi
+    # vendor/ belongs to root: `composer install` runs as root inside the
+    # container, so the host cannot remove it (ER-022).
+    docker run --rm -v "$WORK":/w --entrypoint sh "$IMAGE" -c 'rm -rf /w/* /w/.[!.]* 2>/dev/null || true' >/dev/null 2>&1 || true
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# The version a path repository claims. A release branch names it in the
+# CHANGELOG heading before the tag exists, which is exactly when it matters.
+version_of() {
+    local v=''
+    [ -f "$SRC/CHANGELOG.md" ] \
+        && v="$(grep -m1 -oE '^## [0-9]+\.[0-9]+\.[0-9]+' "$SRC/CHANGELOG.md" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+    [ -n "$v" ] || { v="$(git -C "$SRC" describe --tags --abbrev=0 2>/dev/null || true)"; v="${v#v}"; }
+
+    printf '%s' "${v:-0.0.1}"
+}
+
+VERSION="$(version_of)"
+
+mkdir -p "$WORK/dist" "$WORK/project"
+git -C "$SRC" archive HEAD | tar -x -C "$WORK/dist" || { printf 'git archive failed\n' >&2; exit 2; }
+
+dirty="$(git -C "$SRC" status --porcelain -- . | head -1)"
+[ -n "$dirty" ] && printf 'note: %s has uncommitted changes; the archive is HEAD, not the working tree\n' "$PKG"
+
+python3 - "$WORK/project/composer.json" "$NAME" "$VERSION" <<'PY'
+import json, sys
+
+out, name, version = sys.argv[1], sys.argv[2], sys.argv[3]
+json.dump({
+    'name': 'dist-smoke/consumer',
+    'description': 'Throwaway consumer for a dist-archive smoke',
+    # `*` so the path repository wins over a published release of the same
+    # number; the installed.json check then proves that it did.
+    'require': {name: '*'},
+    'repositories': [{
+        'type': 'path',
+        'url': '../dist',
+        'options': {'symlink': False, 'versions': {name: version}},
+    }],
+    'minimum-stability': 'dev',
+    'prefer-stable': True,
+    'config': {'allow-plugins': False},
+}, open(out, 'w'), indent=4)
+PY
+
+printf '%s %s — dist archive smoke\n\n' "$NAME" "$VERSION"
+
+docker run --rm -v "$WORK":/w -w /w/project "$IMAGE" sh -c \
+    "git config --global --add safe.directory '*'; composer install --no-dev --no-interaction --no-progress" \
+    || { printf '\ncomposer install failed\n' >&2; exit 1; }
+
+FAILED=0
+
+# 1. the package came from this checkout -------------------------------------
+if out="$(python3 - "$WORK/project/vendor/composer/installed.json" "$NAME" <<'PY'
+import json, sys
+
+path, name = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except OSError as e:
+    print(e); raise SystemExit(3)
+packages = data['packages'] if isinstance(data, dict) else data
+for package in packages:
+    if package['name'] == name:
+        dist = package.get('dist') or {}
+        print(dist.get('url', '?'))
+        raise SystemExit(0 if dist.get('type') == 'path' else 1)
+raise SystemExit(2)
+PY
+)"; then
+    printf '  ok    installed from this checkout\n'
+else
+    case "$?" in
+        1) printf '  FAIL  came from Packagist (%s), not from this checkout\n' "$out" ;;
+        2) printf '  FAIL  %s is not installed at all\n' "$NAME" ;;
+        *) printf '  FAIL  cannot read the install record: %s\n' "$out" ;;
+    esac
+    FAILED=1
+fi
+
+# 2. nothing development-only inside the archive ------------------------------
+VENDOR="$WORK/project/vendor/$NAME"
+found=()
+# The list the understudy family's own smoke uses, verbatim: `docs/` and
+# `resources/` are deliberately absent — a package may ship documentation or an
+# agent skill on purpose.
+for unwanted in tests benchmarks spikes perf examples .github build \
+                .editorconfig .gitattributes .gitignore .php-cs-fixer.php \
+                AGENTS.md CLAUDE.md Makefile composer-require-checker.json \
+                infection.json5 psalm.xml rector.php testo.php; do
+    [ -e "$VENDOR/$unwanted" ] && found+=("$unwanted")
+done
+if [ "${#found[@]}" -eq 0 ]; then
+    printf '  ok    archive is dist-only\n'
+else
+    printf '  FAIL  archive ships %s\n' "${found[*]}"
+    FAILED=1
+fi
+
+# 3. the public classes load from the archive ---------------------------------
+# A PSR-4 prefix pointing at a directory `export-ignore` removed, or a class
+# left behind by it, fails here and nowhere else: the package's own suite always
+# runs against the working tree.
+PROBED="$(python3 - "$SRC" "$WORK/project/probe.php" <<'PY'
+import re, sys
+from pathlib import Path
+
+src, out = Path(sys.argv[1]) / 'src', Path(sys.argv[2])
+ns_re = re.compile(r'^\s*namespace\s+([^;]+);', re.M)
+type_re = re.compile(r'^\s*(?:final\s+|abstract\s+|readonly\s+)*(?:class|interface|enum|trait)\s+(\w+)', re.M)
+
+names = []
+for f in sorted(src.rglob('*.php')):
+    text = f.read_text(errors='replace')
+    if '@api' not in text:
+        continue
+    ns = ns_re.search(text)
+    t = type_re.search(text)
+    if ns and t:
+        names.append(f'{ns.group(1).strip()}\\{t.group(1)}')
+    if len(names) == 8:
+        break
+
+body = ''.join(f"    {chr(39)}{n.replace(chr(92), chr(92) * 2)}{chr(39)},\n" for n in names)
+out.write_text(
+    "<?php\n\nrequire __DIR__ . '/vendor/autoload.php';\n\n$types = [\n" + body + "];\n\n"
+    "$missing = array_values(array_filter($types, static fn (string $t): bool "
+    "=> !class_exists($t) && !interface_exists($t) && !enum_exists($t) && !trait_exists($t)));\n\n"
+    "if ($missing !== []) {\n"
+    "    fwrite(STDERR, 'not loadable from the archive: ' . implode(', ', $missing) . PHP_EOL);\n"
+    "    exit(1);\n"
+    "}\n\n"
+    "fwrite(STDOUT, count($types) . ' public type(s) loaded' . PHP_EOL);\n"
+)
+print(len(names))
+PY
+)"
+
+if [ "$PROBED" = "0" ]; then
+    printf '  skip  no @api type found in src/ to probe\n'
+elif out="$(docker run --rm -v "$WORK":/w -w /w/project "$IMAGE" php probe.php 2>&1)"; then
+    printf '  ok    %s\n' "$out"
+else
+    printf '  FAIL  %s\n' "$out"
+    FAILED=1
+fi
+
+printf '\n'
+if [ "$FAILED" -eq 0 ]; then
+    printf 'PASS  %s\n' "$NAME"
+else
+    printf 'FAIL  %s\n' "$NAME"
+fi
+
+exit "$FAILED"

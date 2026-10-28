@@ -1,0 +1,102 @@
+# The `database-integration` job of a `*-db` package, lifted from
+# yii3-outbox-db (2026-10-28). Append it to the package's build.yml `jobs:`.
+#
+# Why it is mandatory for a package with a migration: docs/evolved-rules.md
+# ER-049. `require-dev` holds a single `yiisoft/db-sqlite`, the one engine that
+# accepts a literal DEFAULT on a TEXT column, so a migration that cannot apply
+# on MySQL at all passes every other gate green.
+#
+# Why it is NOT gated on the `changes` filter: a matrix job skipped by its own
+# `if:` reports one check under the raw, unexpanded name (`${{ matrix.database }}
+# integration`), and a PR whose required checks name the expanded ones waits
+# forever. See AGENTS.md § build.yml.
+#
+# Placeholders: {{PACKAGE_SNAKE}} — the database/user name (and password; it is
+# a throwaway service container, so they match on purpose, and the value is
+# visible in the workflow by design), {{PACKAGE_UPPER}} — the prefix of the
+# environment variable the Integration suite reads
+# (`<PKG>_TEST_DB=mysql|mariadb|pgsql`). MariaDB is a separate leg from MySQL:
+# 11.6.2+ enables innodb_snapshot_isolation by default, which fails a
+# REPEATABLE READ select-then-update MySQL never does.
+#
+# The action SHAs below are pins, not suggestions: keep them in step with the
+# package's other workflows (Dependabot bumps them in place).
+
+  database-integration:
+    name: ${{ matrix.database }} integration
+    runs-on: ubuntu-latest
+
+    # deliberately ungated: a matrix job skipped by the `changes` filter reports
+    # a single check under the raw, unexpanded name, which wedges a PR forever
+    # once that name is a required status check
+
+    strategy:
+      fail-fast: false
+      matrix:
+        database:
+          - mysql
+          - mariadb
+          - pgsql
+
+    services:
+      mysql:
+        image: mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+        env:
+          MYSQL_DATABASE: {{PACKAGE_SNAKE}}
+          MYSQL_ROOT_PASSWORD: {{PACKAGE_SNAKE}}
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -hlocalhost -uroot -p{{PACKAGE_SNAKE}}"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      # MariaDB separately from MySQL: 11.6.2+ enables innodb_snapshot_isolation
+      # by default, which fails a REPEATABLE READ select-then-update on a row
+      # changed in between (yii3-outbox-db#40) — MySQL never does
+      mariadb:
+        image: mariadb:11.8@sha256:6422478cb8e159f080fb1d8ccf65101e26fe51385787fde7d16c3b165a331f15
+        env:
+          MARIADB_DATABASE: {{PACKAGE_SNAKE}}
+          MARIADB_ROOT_PASSWORD: {{PACKAGE_SNAKE}}
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      postgres:
+        image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
+        env:
+          POSTGRES_DB: {{PACKAGE_SNAKE}}
+          POSTGRES_PASSWORD: {{PACKAGE_SNAKE}}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d {{PACKAGE_SNAKE}}"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          extensions: json, mbstring, pdo_mysql, pdo_pgsql, pdo_sqlite
+          tools: composer:v2
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Run integration suite
+        run: vendor/bin/testo --suite=Integration
+        env:
+          {{PACKAGE_UPPER}}_TEST_DB: ${{ matrix.database }}

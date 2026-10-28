@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# backfill-releases — create a GitHub Release for every tag that predates
+# templates/.github/workflows/release.yml, across every public rasuvaeff/*
+# repository.
+#
+# Without this, only tags pushed after 2026-08-01 get a Release automatically
+# (the workflow reacts to `push: tags: v*`, not to tags that already exist).
+# GitHub Releases are the artifact the workflow was built to produce;
+# backfilling makes the account's release history match what CHANGELOG.md
+# already says, instead of every repository showing "no releases" for
+# everything shipped before the workflow existed.
+#
+# Idempotent: a tag that already has a Release is skipped, forever. A Release
+# is never deleted or recreated — Packagist blocks a re-tagged version
+# permanently, and treating a Release the same way (never touch one that
+# exists) keeps this script safe to re-run after interruption or after new
+# tags land.
+#
+# "Latest release" is fixed up explicitly at the end of each repository,
+# rather than left to `gh release create`'s default: without `--latest`, the
+# API's own default is `make_latest=true` on every single create call — not a
+# semver comparison — so backfilling oldest-to-newest-in-git-history but
+# newest-to-oldest-in-loop-order (the order `gh api tags` returns them) makes
+# the OLDEST tag "latest", since it is the last one the loop creates. Every
+# backfilled release is created with `--latest=false`; the true latest tag
+# (highest by `sort -V`) is marked latest in one `gh release edit` call after
+# the loop, whether its release was just created or already existed.
+#
+# Usage:
+#   bin/backfill-releases                 dry run across every public repo
+#   bin/backfill-releases --execute       create the missing releases
+#   bin/backfill-releases --execute repo-a repo-b   only these repositories
+#
+# Exit codes: 0 ok (including "nothing to do"), 1 a `gh` call failed.
+
+# No `set -e`: this is a long batch job over the network, run once per repo
+# per tag. A single transient `gh api` failure (secondary rate limit, TLS
+# handshake timeout) must not silently kill the run for the other ~50
+# repositories — every external call below is guarded explicitly instead, and
+# `total_failed` is what decides the exit code.
+set -uo pipefail
+
+EXECUTE=0
+REPOS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --execute) EXECUTE=1 ;;
+    --dry-run) EXECUTE=0 ;;
+    -h|--help)
+      sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) REPOS+=("$arg") ;;
+  esac
+done
+
+if [ "${#REPOS[@]}" -eq 0 ]; then
+  mapfile -t REPOS < <(gh repo list rasuvaeff --limit 100 --json name --jq '.[].name')
+fi
+
+echo "Mode: $([ "$EXECUTE" -eq 1 ] && echo EXECUTE || echo 'dry-run (pass --execute to create releases)')"
+echo "Repositories: ${#REPOS[@]}"
+echo
+
+total_tags=0
+total_missing=0
+total_created=0
+total_failed=0
+
+for repo in "${REPOS[@]}"; do
+  full="rasuvaeff/$repo"
+
+  tags="$(gh api "repos/$full/tags" --paginate --jq '.[].name' 2>/dev/null || true)"
+  if [ -z "$tags" ]; then
+    continue
+  fi
+
+  # Two separate guarded steps, not one pipeline: under `pipefail`, a failing
+  # `gh api` still fails the whole pipeline even when the stage after it is
+  # `|| true`-guarded — pipefail looks at every stage, not just the last one.
+  changelog_b64="$(gh api "repos/$full/contents/CHANGELOG.md" --jq '.content' 2>/dev/null || true)"
+  changelog="$(printf '%s' "$changelog_b64" | base64 -d 2>/dev/null || true)"
+
+  repo_missing=0
+
+  while IFS= read -r tag; do
+    [ -z "$tag" ] && continue
+    total_tags=$((total_tags + 1))
+
+    if gh api "repos/$full/releases/tags/$tag" >/dev/null 2>&1; then
+      continue
+    fi
+
+    total_missing=$((total_missing + 1))
+    repo_missing=$((repo_missing + 1))
+
+    version="${tag#v}"
+    notes=""
+    if [ -n "$changelog" ]; then
+      notes="$(printf '%s\n' "$changelog" | awk -v v="$version" '
+        $0 ~ "^## +" v "( |$|—|-)" { found = 1; next }
+        found && /^## / { exit }
+        found { print }
+      ')"
+    fi
+    if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+      notes="See [CHANGELOG.md](https://github.com/$full/blob/master/CHANGELOG.md)."
+    fi
+
+    if [ "$EXECUTE" -eq 0 ]; then
+      echo "  would create  $full  $tag"
+      continue
+    fi
+
+    if printf '%s' "$notes" | gh release create "$tag" --repo "$full" --title "$tag" --notes-file - --latest=false >/dev/null 2>&1; then
+      echo "  created       $full  $tag"
+      total_created=$((total_created + 1))
+    else
+      echo "  FAILED        $full  $tag" >&2
+      total_failed=$((total_failed + 1))
+    fi
+  done <<< "$tags"
+
+  if [ "$EXECUTE" -eq 1 ]; then
+    highest="$(printf '%s\n' "$tags" | sort -V | tail -1)"
+    if [ -n "$highest" ]; then
+      if ! gh release edit "$highest" --repo "$full" --latest >/dev/null 2>&1; then
+        echo "  FAILED        $full  could not mark $highest as latest" >&2
+        total_failed=$((total_failed + 1))
+      fi
+    fi
+  fi
+
+  [ "$repo_missing" -gt 0 ] && [ "$EXECUTE" -eq 0 ] && echo "  -- $repo: $repo_missing tag(s) without a release --"
+done
+
+echo
+echo "Tags seen: $total_tags   Missing releases: $total_missing   Created: $total_created   Failed: $total_failed"
+
+[ "$total_failed" -eq 0 ]

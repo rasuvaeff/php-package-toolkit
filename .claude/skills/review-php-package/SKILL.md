@@ -28,6 +28,7 @@ make audit-package
 | Every `@api` type named in `README.md`/`llms.txt` (warn) | 7 |
 | `examples/*.php` lint; server-independent ones run without fatal | 7 (examples) |
 | No stale `make x:y` commands in docs | 7 (commands) |
+| Exactly one `## Unreleased` in `CHANGELOG.md`, above every released version | 7 (changelog) |
 
 `FAIL` ⇒ error (non-zero exit, gates CI); `WARN` ⇒ advisory. Server-dependent
 examples are detected from the `Needs server?` column of `examples/README.md` and

@@ -624,6 +624,77 @@ Unit and would never see such a test. The boundary bug itself (trimmed-key
 `str_starts_with` + substr by the unstripped length) is what PR #350 closed.
 **Status:** resolved (require `^2.1`; document the recipe only together with a test that runs it)
 
+### ER-048 — A stale DI-migration warning lives in nine `*-db` READMEs
+
+**Source:** sweep 2026-08-20, fixed in `yii3-outbox-db` first.
+
+**What happened.** Every `*-db` package carries a paragraph saying "do not
+configure the migration through the DI container", whose second half went
+stale: "adding such a definition brings the container down at build time on
+every request, because the class is not autoloaded". That was true while
+migrations lived in `migrations/`, outside PSR-4. With ER-027/ER-028 they moved
+to `src/Migration/` under the package namespace and autoload like any other
+class — there is no fatal.
+
+The first half stayed true: `MigrationService` builds the migration through
+`Injector::make()` (verified against `yiisoft/db-migration` 2.1 sources), which
+resolves constructor arguments by type and never reads a container definition
+keyed by the class being created. As written, the paragraph read as a
+contradiction of the registration recipe above it — `MigrationService::setSourceNamespaces()`
+in DI *is* the supported way.
+
+**Rule.** On the next README edit of any `*-db` package, replace the paragraph:
+the DI entry point is `MigrationService`, and a definition keyed by the
+migration class simply has no effect. Do not roll this out as a wave — replace
+it lazily, when touching the file anyway. Find the survivors by grepping for
+`fatal at build time`.
+
+**Status:** active
+
+### ER-049 — A literal `DEFAULT` on a TEXT column: the migration never applies on MySQL, and CI on SQLite alone cannot see it
+
+**Source:** issues `yii3-tenancy-db#15`, `yii3-feature-flags-db#28`,
+`yii3-ab-testing-db#22`, `yii3-idempotency-db#18` — one copied pattern, found
+by a sweep 2026-08-22, closed 2026-08-23.
+
+**Rule:** MySQL and MariaDB reject a literal `DEFAULT` on a
+`BLOB`/`TEXT`/`GEOMETRY`/`JSON` column — error 1101 (`BLOB, TEXT, GEOMETRY or
+JSON column '<c>' can't have a default value`). This is not a warning:
+`createTable` fails, the transactional migration rolls back, and `migrate:up`
+returns **having created no table at all**. So `'attributes' => "text NOT NULL
+DEFAULT '{}'"` is not cosmetics — it is "the package does not install on MySQL
+at all".
+
+Why it survives a green CI: `*-db` packages require the abstract `yiisoft/db`,
+the consumer supplies the driver, and `require-dev` holds a single
+`yiisoft/db-sqlite` — the one engine that accepts such DDL (PostgreSQL accepts
+it too). The migration never meets the engine it is broken on. The same blind
+spot as ER-045, a different symptom.
+
+| Who writes the column | Shape |
+|---|---|
+| The package itself (a `save()`/`upsert()` writing every column) | `text NOT NULL`, no `DEFAULT` — the default was dead weight |
+| Only the consumer (the package never writes the table) | `text NULL` — otherwise an `INSERT` omitting the column starts failing; the mapper must read `NULL` as the empty value |
+
+`DEFAULT NULL` is no escape either: `yiisoft/db-mysql` renders a parsed
+`DEFAULT NULL` as the string `'NULL'` and fails the same way.
+
+Make the fix **in place**, not in a catch-up migration: `yiisoft/db-migration`
+records only the migration *name* in history, with no checksum, so an
+installation that already applied the file never reads its body again; on
+PostgreSQL/SQLite only a default nobody reads diverges, and on MySQL nothing
+was applied at all. A new migration would not help either — the chain never
+reaches it.
+
+The regression is closed by two tests, not one: (1) a cheap assertion that
+`getDefaultValue() === null` in the SQLite test, which runs on every PR with no
+containers; (2) a `CrossDatabaseMigrationTest` applying the real migration to
+live MySQL/PostgreSQL from service containers (`<PKG>_TEST_DB=mysql|pgsql`).
+The job is a matrix job and **ungated** — a matrix job skipped by a `changes`
+filter reports a single check under its raw name (see `AGENTS.md` § build.yml).
+
+**Status:** active
+
 ---
 
 ## Yii3 / library-specific pitfalls
@@ -796,6 +867,40 @@ does not match the basename pattern, so the script is treated as lint-only
 and never actually executed, without a single visible error. When adding an
 example, use the bare backtick form in the Script column, otherwise the audit
 silently loses coverage for it.
+**Status:** active
+
+### ER-050 — No gate looks at the distribution: `export-ignore` is only visible from the archive
+
+**Source:** `understudy` 0.1.0 (24 spike files, 116K, shipped inside the tag
+archive), `understudy-phpstan` 0.1.0 (`composer-require-checker.json` in the
+archive); closed 2026-08-26.
+
+**Rule:** `composer build`, psalm, testo, infection and `bin/package-audit` all
+read the **working tree**. What the consumer downloads is `git archive <tag>`
+with `export-ignore` from `.gitattributes` applied. Between those two trees
+there is not a single check: a forgotten `export-ignore` line turns nothing red
+and is discovered only when somebody unpacks the archive. Symmetrically,
+`bin/verify-clean-clone` clones the whole repository, so it is not looking at
+the distribution either.
+
+The check is a throwaway project that installs the package **from the archive**
+rather than through a path repository on the directory: a path repository copies
+the working tree, `tests/` included, and the blind spot survives. The shape, as
+the understudy family's own consumer smoke implements it and as `bin/dist-smoke`
+generalizes it for a single package (written 2026-10-28, run on four packages so
+far): `git archive HEAD | tar -x` into a separate
+directory, a path repository onto *that*, `composer install`, and two
+assertions afterwards — that the package came from the path repository and not
+from Packagist (`vendor/composer/installed.json` → `dist.type == "path"`,
+otherwise the leg silently tests the published release), and that
+`vendor/<pkg>/` holds no dev directory and no tooling config.
+
+Rollout is lazy: the rule is written down, there is no wave across every
+published package. Apply it where the package already carries a consumer smoke,
+and on the first touch of `.gitattributes` in a published package — compare the
+archive (`git archive HEAD | tar -t | awk -F/ '{print $1}' | sort -u`) against
+the list of what the package is supposed to hand out.
+
 **Status:** active
 
 ---

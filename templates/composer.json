@@ -21,7 +21,7 @@
     "require-dev": {
         "ergebnis/composer-normalize": "^2.51",
         "friendsofphp/php-cs-fixer": "^3.95",
-        "infection/infection": "^0.33",
+        "infection/infection": "^0.35",
         "maglnet/composer-require-checker": "^4.17",
         "rasuvaeff/rector-named-literals": "^1.0",
         "rector/rector": "^2.4",
@@ -51,6 +51,11 @@
             "ext-intl": "1.0.0"
         },
         "sort-packages": true
+    },
+    "extra": {
+        "skills": {
+            "source": "resources/skills"
+        }
     },
     "scripts": {
         "bc-check": "roave-backward-compatibility-check",

@@ -26,6 +26,9 @@ docker run --rm -v "$PWD":/app -w /app composer:2 composer build
 - [ ] `composer.json` has `homepage` and `support` URLs
 - [ ] `.gitattributes` marks dev files as `export-ignore`
 - [ ] No `App\*` imports in src/ or tests/ (grep `rg '^use App\\' src tests`)
+- [ ] recommended since 2026-10-28: `bin/dist-smoke <pkg>` passes — the archive
+      a consumer downloads holds no dev directory and no tooling config, and its
+      public types load from it. No other gate reads that tree (ER-050)
 
 If any check fails — **stop and fix before publishing**.
 
