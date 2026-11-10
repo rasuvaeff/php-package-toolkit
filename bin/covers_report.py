@@ -14,26 +14,12 @@ ROOT = Path(os.environ.get('MONOREPO_ROOT') or Path(__file__).resolve().parent.p
 AUDIT = Path(sys.argv[1])
 OUT = Path(sys.argv[2])
 
-# constructs Infection actually mutates (conditionals, arithmetic, comparisons,
-# boolean logic, literal returns, array items)
-LOGIC_RE = re.compile(
-    r'\b(if|foreach|for|while|switch|match|elseif)\b'
-    r'|[<>]=?|===|!==|&&|\|\||\?\?|\+\+|--|\breturn\s+(true|false|null|-?\d)')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from covers_audit import has_logic  # noqa: E402
 
 
 def classify(pkg, rel, kind):
-    text = (ROOT / pkg / rel).read_text(errors='replace')
-    body = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-    body = re.sub(r'^\s*(use|namespace|declare)[^;]*;', '', body, flags=re.M)
-    name = Path(rel).stem
-    if name.endswith('Exception') or 'extends \\?\\w*Exception' in body:
-        if not LOGIC_RE.search(body):
-            return 'trivial'
-    if kind == 'interface':
-        return 'trivial'
-    if kind == 'enum' and 'function' not in body:
-        return 'trivial'
-    return 'real' if LOGIC_RE.search(body) else 'trivial'
+    return 'real' if has_logic(ROOT / pkg / rel, kind) else 'trivial'
 
 
 rows = []
@@ -63,8 +49,8 @@ lines = [
     'produces **zero mutants** — the package\'s mutation gate says nothing about it,',
     'no matter how thoroughly the test suite exercises it at runtime.',
     '',
-    f'Snapshot of {date.today().isoformat()}. Published library packages only: '
-    f'`"type": "library"` with an `origin` remote — an application has no mutation '
+    f'Snapshot of {date.today().isoformat()}. Published packages only (the frozen `property-testing` excluded): '
+    f'anything but `"type": "project"`, with an `origin` remote — an application has no mutation '
     f'gate to lie about, and an unreleased checkout has no consumer to mislead. '
     f'Regenerate with:',
     '',
@@ -75,8 +61,16 @@ lines = [
     '',
     f'- types scanned: **{sum(1 for _ in rows)}** flagged out of all `src/` types',
     f'- with real mutable logic: **{len(real)}** across **{len(by_pkg)}** packages',
-    f'- trivial (pure enums, logic-free exceptions, interfaces): {len(trivial)} — no mutants would exist anyway',
+    f'- trivial (interfaces and types with no mutable construct: DTOs, logic-free exceptions and enums): {len(trivial)} — no mutants would exist anyway',
     f'- of the {len(real)} real ones, **{sum(1 for r in real if r["integration_only"])}** are exercised only by a `#[CoversNothing]` integration test',
+    '- still true on `testo/codecov` 0.2.5: its changelog keeps lines outside `#[Covers]` in the coverage report as uncovered, but Infection',
+    '  still generates no mutants for them. Measured on `retry`: pointing two tests',
+    '  at another class dropped 413 to 408 mutants with `Not Covered: 0`.',
+    '- a type exercised only in a subprocess (`understudy-phpstan` runs PHPStan via',
+    '  `exec()`) is invisible to pcov too, so a `#[Covers]` cannot fix it: it needs an',
+    '  in-process test.',
+    '- the "logic" filter is a regex over the source, an upper bound: confirm a package',
+    '  by adding `#[Covers]` and comparing the mutant count before and after.',
     '',
     '## Types with real logic and zero mutants',
     '',

@@ -78,6 +78,16 @@ mutants. A workspace-wide audit (`bin/covers_audit.py`, report in
 packages** carry real logic and zero mutants; 15 of them are reachable only
 through a `#[CoversNothing]` test. The worst case — `yii3-ab-testing-db`:
 `DbExperimentRepository` and six console commands.
+
+**Recount 2026-11-01.** The numbers above are inflated: the "has logic" filter
+took the `<` of `<?php` for logic, so DTOs landed among the "real" ones. After
+fixing `bin/covers_report.py` and narrowing the audit to published packages
+(without the frozen `property-testing`): **69 types in 16 packages** (3 only via
+`CoversNothing`), 19 of them `understudy-phpstan` rules that are visible only in
+a separate PHPStan process and cannot be fixed with `#[Covers]`. Re-checked on
+`testo/codecov` 0.2.5, whose changelog promises to keep lines outside `#[Covers]`
+uncovered in the report: on `retry`, two tests pointed at another class dropped
+the mutant count 413 → 408 with `Not Covered: 0` — the hole is not closed.
 **Status:** active
 
 ### ER-004 — `#[Covers]` scoring does not save untested branches inside test code itself

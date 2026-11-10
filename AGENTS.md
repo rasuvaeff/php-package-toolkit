@@ -131,7 +131,7 @@ NOT export-ignore `resources/`: the skill is part of what the consumer installs.
         "roave/backward-compatibility-check": "^8.0",
         "testo/bridge-infection": "^0.1.6",
         "testo/testo": "^0.10.25",
-        "vimeo/psalm": "^6.16"
+        "vimeo/psalm": "^7.0"
     }
 }
 ```
@@ -161,7 +161,7 @@ build       — the full gate: validate → normalize → require-checker → cs
 bc-check    — roave-backward-compatibility-check
 cs          — php-cs-fixer --dry-run --diff
 cs:fix      — php-cs-fixer --diff
-mutation    — infection --threads=max (testFramework: testo, needs the pcov/xdebug extension)
+mutation    — infection --threads=max --with-uncovered (testFramework: testo, needs the pcov/xdebug extension)
 psalm       — psalm --no-cache
 rector      — rector process --dry-run
 rector:fix  — rector process
@@ -171,6 +171,58 @@ test        — testo --suite=Unit
 test:coverage — testo --suite=Unit --coverage --coverage-clover=build/coverage.xml
 test:coverage:ci — testo --suite=Unit --coverage-clover=build/coverage.xml
 ```
+
+### Mutation testing: `--with-uncovered` is mandatory
+
+Without the flag Infection creates no mutants for code outside a test's `#[Covers]`: Testo
+leaves such code uncovered in the report, and Infection mutates only covered code by default.
+The result is `Not Covered: 0` and 97% while more than half of the mutants do not exist
+(`json-ld`, 2026-11-01: 1169 mutants without the flag, 2726 with it, 1557 of them
+`Not Covered`, total MSI 41%). See `docs/mutation-blind-spots.md`, `docs/mutation-honest-msi.md`,
+ER-003.
+
+- New package: `"mutation": "infection --threads=max --with-uncovered"` from
+  `templates/composer.json`; `minMsi` is measured against the **total** MSI.
+- **Lazy rollout.** Published packages keep the old command until a PR touches their `src/`,
+  `tests/` or the mutation gate. Touched it — add the flag and bring the total MSI up to the
+  **package's existing `minMsi`** without lowering it: the gap is closed with `#[Covers]` on tests
+  that already execute the code, and with new tests. Lowering `minMsi` to the honest number is
+  forbidden, except as a last resort on the owner's explicit decision (2026-11-03): after every
+  lever is exhausted, never below 85, to a stable value with a ~1.5 pp margin over the worst run,
+  with the reason recorded in `infection.json5` and in the status file; the agent never lowers the
+  threshold itself.
+- `templates/infection.json5` ignores mutants on parameter defaults in signatures through
+  `mutators.global-ignoreSourceCodeByRegex` (pattern without `^` and `$`: Infection wraps it in
+  `^-\s*REGEX$` itself). Verified on `bulkhead` (6), `circuit-breaker` (13), `json-ld` (19): only
+  lines like `private int $x = 100,` are removed; Escaped and Timed Out do not change. This takes
+  out of the denominator what cannot be killed and raises MSI by 1–2 pp without new tests: a PR
+  states MSI before and after the ignore separately and does not hide the `Ignored` count. Every few
+  releases drop the rule for one run and check whether these mutants have become coverable (for
+  example after a driver change).
+- The `mutation` script in `templates/composer.json` starts with
+  `Composer\Config::disableProcessTimeout`: Composer's script timeout is 300 seconds, and a full
+  run with the flag on a large package (`json-ld`, 2652 mutants) takes longer.
+- `templates/infection.json5` disables the `PublicVisibility` and `ProtectedVisibility` mutators:
+  with the flag, their mutants on a parameterless method's signature line are always
+  `Not Covered` (there is no executable opcode there) and no `#[Covers]` kills them. Pilot on
+  `pinned-http-client` (2026-11-01): 4 of 4 such mutants, 0 killed; total MSI from 93% to 95%,
+  `composer mutation` passes twice in a row; for `ProtectedVisibility` (`understudy-phpunit`) —
+  4 of 4 `Not Covered`. Defaults in a constructor signature (`Increment/DecrementInteger`) are not
+  cured by this.
+- `templates/infection.json5` sets `"testFrameworkOptions": "--suite=Unit"`: every package has a
+  `Benchmarks` suite (`testo.php`), and Infection's initial run would execute it otherwise; a
+  benchmark is timing-sensitive, turns red under load and aborts the whole mutation run (`result`,
+  2026-11-03). Verified on `duration` and `retry`: mutant count and MSI are identical with and
+  without the option. Already-migrated packages get it lazily when `infection.json5` is touched.
+  Testo packages only: a PHPUnit package (`property-testing-phpunit`) keeps `testFramework:
+  phpunit`, and this option does not carry over.
+- **A local mutation run must match CI.** CI runs with `zend.assertions` off, so `\assert()` in
+  `src/` is not compiled and its mutants are `Not Covered` there, while a local image executes and
+  kills them: `yii3-feature-flags-ui` gave 95% locally and 93% in CI. Before `infection` in the
+  container run `echo 'zend.assertions=-1' > /usr/local/etc/php/conf.d/zz-ci.ini`, and measure the
+  margin over `minMsi` on such a run (at least about 1.5 pp). PHP 8.5 locally versus 8.4 in CI made
+  no difference to mutation results.
+- The picture across all packages comes from a local `--with-uncovered` run (see ER-003), not CI.
 
 `composer.lock` is gitignored (this is a library).
 
@@ -468,7 +520,7 @@ public static function delayStaysWithinCapGenerators(): array
 |---|---|
 | `#[Property(runs: N)]` | The attribute from `Rasuvaeff\PropertyTesting\Property`; `runs` ≥ 1 (default 100) |
 | Generators | A `public static function <testMethod>Generators(): array` returning `['arg' => Gen::...]` keyed by parameter name. **Strictly public static** (rector's `RemoveUnusedPrivateMethodRector` deletes private ones — they are only ever called through reflection; public is untouched by every rule, and it does not become a test because it does not return `void`). `public` without `static` only when the body needs `$this`. There is NO `#[Given]` attribute. Since `-testo` ≥0.5 `generators`/`examples` in `#[Property]` also accept a callable — `[Provider::class, 'method']`, `'Provider::method'`, an invokable object (`new Provider()`) — for sets reused across test classes; a string resolves first as a method of its own class (a local method wins over a same-named global function) |
-| `Gen::*` | `int`, `intBetween`, `intPositive`, `float`, `floatBetween`, `bool`, `string`, `stringAscii`, `stringOf`, `stringFrom` (an alphabet without separators — for parser inputs), `bytes` (raw/HMAC), `arrayOf`, `nonEmptyArrayOf`, `uniqueArrayOf` (ids/keys), `dictOf` (header maps), `record` (typed VOs), `oneOf`, `elements`, `enum`, `frequency` (weighted choice), `nullable`, `map`, `flatMap`, `filter`, `tuple`, `recursive` (trees), `uuid`, `datetime`, `ipv4`, `email`, `url`, `json`, `jsonString`, `regex`/`stringMatching` (a PCRE subset), `commands` (for stateful) |
+| `Gen::*` | `int`, `intBetween`, `intPositive`, `float`, `floatBetween`, `bool`, `string`, `stringAscii`, `stringOf`, `stringFrom` (an alphabet without separators — for parser inputs), `bytes` (raw/HMAC), `naughtyString` (ready-made dangerous strings: `"a\n"`, `"\0"`, injections, invalid UTF-8; with `exhaustive: true` — each once), `mixed` (any PHP type, for testing how a `mixed` input is narrowed; inference from a `mixed` signature is still rejected), `arrayOf`, `nonEmptyArrayOf`, `uniqueArrayOf` (ids/keys), `dictOf` (header maps), `record` (typed VOs), `oneOf`, `elements`, `enum`, `frequency` (weighted choice), `nullable`, `map`, `flatMap`, `filter`, `tuple`, `recursive` (trees), `uuid`, `datetime`, `ipv4`, `email`, `url`, `json`, `jsonString`, `regex`/`stringMatching` (a PCRE subset), `commands` (for stateful) |
 | `Gen::draw($arb)` | An in-body draw inside the property body for several dependent values (when a nested `flatMap` gets unwieldy). Only valid inside a property run (otherwise `RuntimeException`); it shows up in the counterexample as `draw#N` |
 | `<method>Examples()` | A `public static function <testMethod>Examples(): iterable` returning named tuples of arguments, run **before** the random phase. Auto-discovered by name. Pins known edge cases found by mutations or audits — without them the regression holds on the random phase's dice alone |
 | `Classify::cover($cond, $label, $minPercent)` | A coverage gate: when the share of runs meeting the condition is below the threshold — `CoverageFailed`, even if every run passed. Required when the property body branches and every branch must be reached (delivery status, error categories, retry outcomes). `Classify::when($cond, $label)` / `Classify::label($label)` merely tag the distribution, no gate |
@@ -676,6 +728,14 @@ reinvent it.
     on `release-check` (see the "Helper generator" row above).
   A dependency edit; it needs no issue-first. **Do not apply when the change is
   strictly orthogonal** (docs or `examples/` only).
+- **Moving to Psalm 7 — the same rider, equally lazy** (owner's decision
+  2026-11-04). If a PR already touches a package on `"vimeo/psalm": "^6.16"`,
+  raise it to `"^7.0"` in that same PR (one major, not a union), run
+  `composer update -W`, then `composer build` and `composer rector`. Packages
+  that ship a Psalm plugin (`understudy-psalm`) move right away, not lazily: the
+  plugin's code runs inside the consumer's Psalm. A dependency edit; it needs no
+  issue-first. **Do not apply when the change is strictly orthogonal** (docs or
+  `examples/` only).
 
 ### release.yml
 
@@ -1120,7 +1180,9 @@ Or through the Makefile: `make build`, `make cs-fix`, `make psalm`, `make test`.
    `#[Covers]`/`#[CoversNothing]` on test classes, that `@api` types are mentioned
    in `README.md`/`llms.txt`, lint plus execution of the server-independent
    `examples/*.php`, the absence of stale `make x:y` references in the docs, and
-   exactly one `## Unreleased` in `CHANGELOG.md`, above every released version.
+   exactly one `## Unreleased` in `CHANGELOG.md`, above every released version;
+   a `src/` type with logic named in no `#[Covers]` (zero mutants; WARN, or ERROR
+   with `PKG_AUDIT_COVERS_STRICT=1`; `docs/evolved-rules.md` ER-003).
    `FAIL` is an error (non-zero exit), `WARN` is informational. After that, the
    manual steps below cover only what the script does not.
 1. **Read the rules**: the root `AGENTS.md` plus the package `AGENTS.md`.

@@ -14,6 +14,7 @@
 #
 # Env:
 #   PKG_AUDIT_NO_EXAMPLES=1   skip the examples lint/run check (fast structural-only run)
+#   PKG_AUDIT_COVERS_STRICT=1 make the mutation-blind check (check 9) an ERROR instead of a WARN
 #
 # Exit code: non-zero if any audited package has at least one ERROR.
 
@@ -257,6 +258,34 @@ audit_one() {
     e=$((e + 1)); err "CHANGELOG.md carries '## Unreleased' below a released version: that content shipped and its notes never said so"
   fi
   check_line "changelog" "$e" 0 "$([ "$e" -gt 0 ] && echo "unreleased headings: $n_unrel, below a version: $n_stray")"
+
+  # 9. src types with logic that no #[Covers] names -----------------------------
+  # Testo builds its coverage report from #[Covers] attribution, and Infection
+  # generates mutants only for what that report covers. A type with logic named
+  # in no #[Covers] therefore has ZERO mutants, and the mutation gate stays green
+  # (`Not Covered: 0`, 100%) without ever having looked at it. Re-measured on
+  # testo/codecov 0.2.5 (retry, 2026-11-01); see docs/mutation-blind-spots.md.
+  # WARN by default; PKG_AUDIT_COVERS_STRICT=1 turns it into an ERROR.
+  local blind=() blind_line
+  if command -v python3 >/dev/null 2>&1; then
+    while IFS=$'\t' read -r blind_line _; do
+      [ -n "$blind_line" ] || continue
+      blind+=("$blind_line")
+      if [ "${PKG_AUDIT_COVERS_STRICT:-0}" = 1 ]; then
+        err "src type with logic named in no #[Covers] (zero mutants): $blind_line"
+      else
+        warn "src type with logic named in no #[Covers] (zero mutants): $blind_line"
+      fi
+    done < <(python3 "$REPO_ROOT/bin/covers_audit.py" --package "$pkg" 2>/dev/null)
+    if [ "${PKG_AUDIT_COVERS_STRICT:-0}" = 1 ]; then
+      check_line "mutation blind" "${#blind[@]}" 0 "$([ "${#blind[@]}" -gt 0 ] && echo "${#blind[@]} types, first: ${blind[0]}")"
+    else
+      check_line "mutation blind" 0 "${#blind[@]}" "$([ "${#blind[@]}" -gt 0 ] && echo "${#blind[@]} types, first: ${blind[0]}")"
+    fi
+  else
+    warn "mutation blind check skipped: python3 not found"
+    check_line "mutation blind" 0 1 "python3 not found"
+  fi
 
   # summary --------------------------------------------------------------------
   local ne=${#ERRORS[@]} nw=${#WARNS[@]}

@@ -20,7 +20,7 @@ This is a **showcase, not a product.**
   answer to "how does one person keep 90 packages consistent, statically clean,
   mutation-tested and release-safe?" That answer is a process, and this is the
   process, verbatim.
-- **It is a snapshot, last refreshed 2026-10-28, not a mirror.** The working copy lives in
+- **It is a snapshot, last refreshed 2026-11-10, not a mirror.** The working copy lives in
   a private monorepo and keeps moving; this repository is not expected to track
   it. Read it as a record of how the packages were built, not as the current
   state of anyone's build system. The packages themselves are the living
@@ -38,6 +38,7 @@ Copy anything you find useful. Expect to adapt it.
 | [`templates/`](templates/) | The skeleton a new package is cut from: `composer.json`, psalm/rector/infection/php-cs-fixer configs, `Makefile`, hardened GitHub Actions workflows, branch-protection payload, doc stubs |
 | [`templates/optional/`](templates/optional/) | What a package takes only when it needs it: the shipped agent-skill stub, a property-test generator provider, the `*-db` cross-database migration test and its ungated `database-integration` job, and the documentation-site CI (Pages build, external-link checker, Vale config) |
 | [`docs/mutation-blind-spots.md`](docs/mutation-blind-spots.md) | The report behind `ER-003`, regenerated from the live workspace: every `src/` type named in no `#[Covers]`, and therefore carrying zero mutants, split into "real logic" and "nothing to mutate anyway" |
+| [`docs/mutation-honest-msi.md`](docs/mutation-honest-msi.md) | The audit that changed the mutation gate: `infection --with-uncovered` across every package showed 19% of all mutants had never existed, and only 4 of 75 packages met their own `minMsi` once they did |
 | [`docs/package-families.md`](docs/package-families.md) | The map: which packages are cores, which are backends, which primitives everything else depends on, and the `bin/dev` selector for each family |
 | [`bin/dev`](bin/dev) + [`bin/dev-lib/`](bin/dev-lib/) | Batch operations across packages — parallel `exec`/`build`/`test`/`psalm`, batch git with `--dry-run`, batch CHANGELOG entries, template replication |
 | [`bin/package-audit`](bin/package-audit) | Deterministic per-package audit: required files, `@api`/`@internal` on every type, `#[Covers]` on every test class, no psalm suppressions, docs mention every public type, examples actually run |
@@ -68,7 +69,7 @@ Outside the build gate, because they need a coverage driver or a previous tag:
 
 | Check | Tool | Setting |
 |---|---|---|
-| Mutation testing | `infection/infection` via `testo/bridge-infection` | `minMsi` starts at 85 and is raised as a package matures |
+| Mutation testing | `infection/infection` via `testo/bridge-infection` | run with `--with-uncovered`, so code outside every `#[Covers]` still gets mutants; `minMsi` starts at 85, is raised as a package matures, and is lowered only by the owner as a recorded last resort, never below 85 |
 | Backwards compatibility | `roave/backward-compatibility-check` | required status check; a release declaring an intentional compatibility boundary (a major, or a minor while below 1.0) in the CHANGELOG is the only one that may carry breaks |
 | Automated refactoring | `rector/rector` | dry run in CI (`static-analysis.yml`) and in `release-check` — it used to run nowhere but a human's terminal, and was red under green builds for five releases of one family |
 

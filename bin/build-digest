@@ -14,6 +14,12 @@
 #   bin/build-digest yii3-outbox psalm
 #   bin/build-digest yii3-outbox require -- rasuvaeff/duration --dry-run
 #
+# A package that links sibling packages into vendor/ as relative symlinks
+# (a `path` repository in composer.json, or a local install that created them,
+# e.g. property-testing-*) gets the monorepo root mounted at /repo and runs from
+# /repo/<package>; otherwise the symlinks point outside the container and every
+# class of a sibling is "not found".
+#
 # Log: <package-dir>/build/digest-<script>.log (overwritten each run;
 # build/* is gitignored in every package template).
 # Exit code: mirrors the underlying `composer <script>` exit code.
@@ -21,7 +27,7 @@
 set -uo pipefail
 
 if [ "$#" -lt 2 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
@@ -41,7 +47,14 @@ pkg_dir="$(cd "$pkg_dir" && pwd)"
 mkdir -p "$pkg_dir/build"
 log="$pkg_dir/build/digest-$script.log"
 
-docker run --rm -v "$pkg_dir":/app -w /app composer:2 composer "$script" "${extra_args[@]}" >"$log" 2>&1
+if grep -qE '"type"[[:space:]]*:[[:space:]]*"path"' "$pkg_dir/composer.json" \
+    || [ -n "$(find "$pkg_dir/vendor" -maxdepth 3 -type l -lname '../../../*' -print -quit 2>/dev/null)" ]; then
+    mount_args=(-v "$(dirname "$pkg_dir")":/repo -w "/repo/$(basename "$pkg_dir")")
+else
+    mount_args=(-v "$pkg_dir":/app -w /app)
+fi
+
+docker run --rm "${mount_args[@]}" composer:2 composer "$script" "${extra_args[@]}" >"$log" 2>&1
 rc=$?
 
 lines=$(wc -l <"$log")

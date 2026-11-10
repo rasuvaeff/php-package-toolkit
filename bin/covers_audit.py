@@ -17,6 +17,8 @@ from pathlib import Path
 # repositories. Defaults to the parent of bin/, overridable for a workspace
 # laid out elsewhere.
 ROOT = Path(os.environ.get('MONOREPO_ROOT') or Path(__file__).resolve().parent.parent)
+# frozen: abandoned in favour of property-testing-core/-testo, takes no new code
+FROZEN = {'property-testing'}
 
 TYPE_RE = re.compile(
     r'^\s*(?:(?:final|abstract|readonly)\s+)*(class|interface|enum|trait)\s+(\w+)',
@@ -27,6 +29,35 @@ COVERS_RE = re.compile(r'#\[\s*(?:\\?[\w\\]*\\)?Covers\s*\(\s*([\\\w]+)::class')
 COVERSNOTHING_RE = re.compile(r'#\[\s*(?:\\?[\w\\]*\\)?CoversNothing')
 # a method body is what Infection can mutate; interfaces never have one
 BODY_RE = re.compile(r'function\s+\w+\s*\([^)]*\)[^;{]*\{')
+
+# constructs Infection actually mutates (conditionals, arithmetic, comparisons,
+# boolean logic, literal returns, ternaries, throws)
+LOGIC_RE = re.compile(
+    r'\b(if|foreach|for|while|switch|match|elseif|try|catch|throw)\b'
+    r'|(?<![-=<])[<>]=?(?![>?])|===|!==|==|!=|&&|\|\||\?\?|\?[^?>]'
+    r'|\breturn\s+(true|false|null|-?\d)|[+*/%]|(?<![-=])-(?![>=])|\.=|\+\+|--')
+
+
+def strip(text):
+    """Source reduced to what Infection can mutate: no tag, comments, attributes,
+    use/namespace, string contents or constructor signature (promoted properties
+    and their defaults are declarations, not logic)."""
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    text = re.sub(r'//[^\n]*', '', text)
+    text = text.replace('<?php', '')
+    text = re.sub(r'^\s*(use|namespace|declare)[^;]*;', '', text, flags=re.M)
+    text = re.sub(r'#\[[^\]]*\]', '', text)
+    text = re.sub(
+        r'function __construct\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)',
+        '', text)
+    return re.sub(r'"[^"\n]*"|\'[^\'\n]*\'', '""', text)
+
+
+def has_logic(path, kind):
+    """True when the type holds something Infection would mutate."""
+    if kind == 'interface':
+        return False
+    return bool(LOGIC_RE.search(strip(path.read_text(errors='replace'))))
 
 
 def php_files(d):
@@ -77,19 +108,55 @@ def covered_names(pkg):
     return fq, short, tests
 
 
+def blind_types(pkg, types=None):
+    """([blind type dicts], [CoversNothing test files]) for one package dir."""
+    types = src_types(pkg) if types is None else types
+    fq, short, tests = covered_names(pkg)
+    nothing_files = [t for t, k in tests if k == 'CoversNothing']
+
+    blind = []
+    for fqcn, name, kind, has_body, rel in types:
+        if fqcn in fq or name in short:
+            continue
+        if kind == 'interface' and not has_body:
+            continue  # nothing for Infection to mutate
+        # which CoversNothing test, if any, mentions this type by name
+        seen_in = [t for t in nothing_files
+                   if re.search(rf'\b{re.escape(name)}\b',
+                                (pkg / t).read_text(errors='replace'))]
+        blind.append({'fqcn': fqcn, 'kind': kind, 'file': rel,
+                      'mentioned_in_coversnothing': seen_in})
+    return blind, nothing_files
+
+
+def check_package(pkg):
+    """Print `<file>\t<kind>` for each blind type that carries logic. Used by
+    bin/package-audit; any package dir, published or not."""
+    pkg = Path(pkg).resolve()
+    if not (pkg / 'src').is_dir() or not (pkg / 'tests').is_dir():
+        return
+    blind, _ = blind_types(pkg)
+    for b in blind:
+        if has_logic(pkg / b['file'], b['kind']):
+            print(f"{b['file']}\t{b['kind']}")
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == '--package':
+        return check_package(sys.argv[2])
+
     report = []
-    for pkg in sorted(p for p in ROOT.iterdir() if (p / 'composer.json').is_file()):
+    for pkg in sorted(p for p in ROOT.iterdir() if p.name not in FROZEN and (p / 'composer.json').is_file()):
         if not (pkg / 'src').is_dir() or not (pkg / 'tests').is_dir():
             continue
-        # Libraries only. An application in the workspace (a sandbox, an example
+        # Packages only (libraries and plugins). An application in the workspace (a sandbox, an example
         # app) has no mutation gate for a blind spot to lie about, and its class
         # count would drown the libraries in the report.
         try:
             manifest = json.loads((pkg / 'composer.json').read_text())
         except ValueError:
             continue
-        if manifest.get('type', 'library') != 'library':
+        if manifest.get('type', 'library') == 'project':
             continue
         # Published packages only. A local-only checkout (an unreleased
         # adapter, a spike) has no consumer to mislead, and naming it in a
@@ -100,21 +167,7 @@ def main():
         types = src_types(pkg)
         if not types:
             continue
-        fq, short, tests = covered_names(pkg)
-        nothing_files = [t for t, k in tests if k == 'CoversNothing']
-
-        blind = []
-        for fqcn, name, kind, has_body, rel in types:
-            if fqcn in fq or name in short:
-                continue
-            if kind == 'interface' and not has_body:
-                continue  # nothing for Infection to mutate
-            # which CoversNothing test, if any, mentions this type by name
-            seen_in = [t for t in nothing_files
-                       if re.search(rf'\b{re.escape(name)}\b',
-                                    (pkg / t).read_text(errors='replace'))]
-            blind.append({'fqcn': fqcn, 'kind': kind, 'file': rel,
-                          'mentioned_in_coversnothing': seen_in})
+        blind, nothing_files = blind_types(pkg, types)
 
         report.append({
             'package': pkg.name,
